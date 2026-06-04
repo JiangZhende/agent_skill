@@ -8,10 +8,13 @@ Skill 安装器：支持从 ZIP 或单个 SKILL.md 安装 skill。
 """
 import re
 import shutil
+import threading
 import zipfile
 from pathlib import Path
 
 from core.skill_loader import Skill, _VALID_NAME_RE
+
+_install_lock = threading.Lock()
 
 _ALLOWED_SUFFIXES = {".py", ".md", ".sh", ".txt", ".yaml", ".yml"}
 
@@ -45,7 +48,7 @@ def install_from_zip(zip_path: str | Path, skills_dir: Path) -> tuple[str, str]:
     Raises: ValueError on validation failure
     """
     zip_path = Path(zip_path)
-    with zipfile.ZipFile(zip_path, "r") as zf:
+    with _install_lock, zipfile.ZipFile(zip_path, "r") as zf:
         names = zf.namelist()
 
         # 判断是否有顶层目录
@@ -92,9 +95,10 @@ def install_from_skill_md(md_path: str | Path, skills_dir: Path) -> tuple[str, s
     text = md_path.read_text(encoding="utf-8")
     skill_name = _validate_skill_md(text, hint=md_path.stem)
 
-    dest = skills_dir / skill_name
-    dest.mkdir(parents=True, exist_ok=True)
-    (dest / "SKILL.md").write_text(text, encoding="utf-8")
+    with _install_lock:
+        dest = skills_dir / skill_name
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "SKILL.md").write_text(text, encoding="utf-8")
 
     return skill_name, f"skill '{skill_name}' 安装成功（无脚本）"
 

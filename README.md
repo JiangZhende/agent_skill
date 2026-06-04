@@ -53,6 +53,7 @@ agent_skills_poc/
 - **文件隔离**：每次 run 独立 workspace，脚本通过 `@input:` / `@output:` / `@workspace:` 引用文件，不接触真实路径
 - **多轮对话**：同一 session 内 agent.memory 保持上下文，点"新对话"开启新 session
 - **Trajectory**：每次 run 自动写 `trajectories/<timestamp>.jsonl`，含 system_prompt，可直接用于 SFT/DPO 训练
+- **多用户并发**：对话完全隔离（workspace、agent 各自独立）；skill 库全局共享，任何人安装的 skill 所有人可用，安装操作串行化保证线程安全
 
 ## 快速开始
 
@@ -117,6 +118,8 @@ my_skill.zip
 **SKILL.md 单文件**（无脚本，适合纯提示类 skill）
 
 安装后无需重启，下次发送任务即生效。
+
+> **注意**：skill 库全局共享，任何用户安装的 skill 对所有用户可见。已在运行中的 session 不受影响，新 skill 在下一次对话（或点"新对话"）时生效。多用户同时安装时会串行排队，安装本身很快，通常感知不到等待。
 
 ## Trajectory 格式
 
