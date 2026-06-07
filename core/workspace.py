@@ -34,7 +34,7 @@ class Workspace:
         max_total_size: int = DEFAULT_MAX_TOTAL_SIZE,
     ):
         self.run_id = run_id or f"run_{uuid.uuid4().hex[:8]}"
-        self.root = Path(tempfile.gettempdir()) / f"agent_{self.run_id}"
+        self.root = Path.home() / ".agent_workspaces" / f"agent_{self.run_id}"
         self.inputs_dir = self.root / "inputs"
         self.workspace_dir = self.root / "workspace"
         self.outputs_dir = self.root / "outputs"
@@ -57,6 +57,12 @@ class Workspace:
         dest = self.inputs_dir / dest_name
         shutil.copy2(src, dest)
         return dest_name
+
+    def clear_inputs(self):
+        """清空 inputs/ 目录下的所有文件，保留目录本身。"""
+        for p in self.inputs_dir.iterdir():
+            if p.is_file():
+                p.unlink()
 
     def list_inputs(self) -> list[dict]:
         return [

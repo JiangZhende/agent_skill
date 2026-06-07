@@ -16,6 +16,22 @@ from core.skill_loader import Skill, _VALID_NAME_RE
 
 _install_lock = threading.Lock()
 
+
+def uninstall_skill(skill_name: str, skills_dir: Path) -> tuple[str, str]:
+    """卸载已安装的 skill，删除其目录。
+
+    Returns: (skill_name, message)
+    Raises: ValueError if skill not found or name invalid
+    """
+    if not _VALID_NAME_RE.match(skill_name):
+        raise ValueError(f"skill name '{skill_name}' 不合法")
+    dest = Path(skills_dir) / skill_name
+    if not dest.exists() or not dest.is_dir():
+        raise ValueError(f"skill '{skill_name}' 不存在")
+    with _install_lock:
+        shutil.rmtree(dest)
+    return skill_name, f"skill '{skill_name}' 已卸载"
+
 _ALLOWED_SUFFIXES = {".py", ".md", ".sh", ".txt", ".yaml", ".yml"}
 
 

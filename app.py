@@ -23,14 +23,22 @@ if _SMOLAGENTS_DEV.exists() and str(_SMOLAGENTS_DEV) not in sys.path:
 from smolagents.gradio_ui import stream_to_gradio
 from core.agent import build_agent
 from core import trajectory as traj_recorder
-from core.skill_installer import install_from_zip, install_from_skill_md
+from core.skill_installer import install_from_zip, install_from_skill_md, uninstall_skill
 from core.skill_loader import SkillRegistry
 from tools import ALL_TOOLS
 
-MODEL_ID = os.getenv("MODEL_ID", "Pro/zai-org/GLM-5.1")
-API_BASE  = os.getenv("API_BASE", "https://api.siliconflow.cn/v1/")
-API_KEY   = os.getenv("API_KEY",  "sk-sptwlpbrnycnelnftjzvfwgdhlznnbgvrimiuzqairsstjou")
-SKILLS_DIR = PROJECT_ROOT / "skills"
+try:
+    from dotenv import load_dotenv
+    load_dotenv(PROJECT_ROOT / ".env")
+except ImportError:
+    pass
+
+MODEL_ID     = os.getenv("MODEL_ID", "Pro/zai-org/GLM-5.1")
+API_BASE     = os.getenv("API_BASE", "https://api.siliconflow.cn/v1/")
+API_KEY      = os.getenv("API_KEY") or ""
+SKILLS_DIR   = PROJECT_ROOT / "skills"
+USE_DOCKER   = os.getenv("USE_DOCKER", "0").strip() in ("1", "true", "yes")
+DOCKER_IMAGE = os.getenv("DOCKER_IMAGE", "agent-sandbox:latest")
 
 
 def _build(upload_files, outputs_dir):
@@ -42,6 +50,8 @@ def _build(upload_files, outputs_dir):
         extra_tools=ALL_TOOLS,
         upload_files=upload_files or None,
         outputs_persist_to=outputs_dir,
+        use_docker=USE_DOCKER,
+        docker_image=DOCKER_IMAGE,
     )
 
 
@@ -57,6 +67,11 @@ def _list_skills_md() -> str:
         icon = "📦" if has_scripts else "📄"
         lines.append(f"- {icon} **{s.name}**：{s.meta.description}  \n  触发词: `{triggers}`")
     return "\n".join(lines)
+
+
+def _list_skill_names() -> list[str]:
+    """返回已安装的 skill 名称列表，供下拉框使用。"""
+    return sorted(SkillRegistry(SKILLS_DIR).skills.keys())
 
 
 def create_app():
@@ -76,18 +91,26 @@ def create_app():
                 extra_tools=ALL_TOOLS,
                 upload_files=file_paths or None,
                 outputs_persist_to=outputs_dir,
+                use_docker=USE_DOCKER,
+                docker_image=DOCKER_IMAGE,
             )
             session["agent"] = agent
             session["outputs_dir"] = str(outputs_dir)
             session["is_new"] = True
         else:
             agent = session["agent"]
+            failed = []
+            newly_added = []
             for f in (file_paths or []):
                 try:
-                    agent.workspace.add_input(f)
-                except Exception:
-                    pass
+                    name = agent.workspace.add_input(f)
+                    newly_added.append(name)
+                except Exception as e:
+                    failed.append(f"{Path(f).name}: {e}")
+            if failed:
+                raise RuntimeError("部分文件上传失败：\n" + "\n".join(failed))
             session["is_new"] = False
+            session["newly_uploaded"] = newly_added
         return agent
 
     def on_submit(task, uploaded_files, history, session, model_id, api_base, api_key):
@@ -98,6 +121,10 @@ def create_app():
         file_paths = [f.name for f in (uploaded_files or [])]
         agent = _get_or_create_agent(session, model_id, api_base, api_key, file_paths)
         reset_memory = session.pop("is_new", True)
+        newly_uploaded = session.pop("newly_uploaded", [])
+        if newly_uploaded:
+            names = "、".join(f"`@input:{n}`" for n in newly_uploaded)
+            task = f"[本轮新上传的文件：{names}]\n{task}"
 
         history = list(history or [])
         history.append({"role": "user", "content": task})
@@ -132,9 +159,9 @@ def create_app():
     # ── Skills 事件 ────────────────────────────────────────────────────────────
 
     def on_skill_upload(skill_file):
-        """安装上传的 ZIP 或 SKILL.md，返回 (状态消息, 更新后的 skill 列表)。"""
+        """安装上传的 ZIP 或 SKILL.md，返回 (状态消息, skill 列表, 卸载下拉框)。"""
         if skill_file is None:
-            return "请先选择文件", _list_skills_md()
+            return "请先选择文件", _list_skills_md(), gr.update()
 
         path = Path(skill_file.name)
         try:
@@ -143,14 +170,27 @@ def create_app():
             elif path.name == "SKILL.md" or path.suffix.lower() == ".md":
                 name, msg = install_from_skill_md(path, SKILLS_DIR)
             else:
-                return f"不支持的文件类型 '{path.suffix}'，请上传 .zip 或 SKILL.md", _list_skills_md()
+                return f"不支持的文件类型 '{path.suffix}'，请上传 .zip 或 SKILL.md", _list_skills_md(), gr.update()
         except Exception as e:
-            return f"安装失败：{e}", _list_skills_md()
+            return f"安装失败：{e}", _list_skills_md(), gr.update()
 
-        return f"✅ {msg}", _list_skills_md()
+        names = _list_skill_names()
+        return f"✅ {msg}", _list_skills_md(), gr.update(choices=names)
+
+    def on_skill_uninstall(skill_name):
+        """卸载选中的 skill，返回 (状态消息, skill 列表, 卸载下拉框)。"""
+        if not skill_name:
+            return "请先选择要卸载的 skill", _list_skills_md(), gr.update()
+        try:
+            _, msg = uninstall_skill(skill_name, SKILLS_DIR)
+        except Exception as e:
+            return f"卸载失败：{e}", _list_skills_md(), gr.update()
+        names = _list_skill_names()
+        return f"🗑️ {msg}", _list_skills_md(), gr.update(choices=names, value=None)
 
     def on_skill_refresh():
-        return _list_skills_md()
+        names = _list_skill_names()
+        return _list_skills_md(), gr.update(choices=names)
 
     # ── 界面布局 ───────────────────────────────────────────────────────────────
 
@@ -256,6 +296,16 @@ def create_app():
                         install_btn = gr.Button("安装 Skill", variant="primary")
                         install_status = gr.Markdown("")
 
+                        gr.Markdown("---")
+                        gr.Markdown("### 卸载 Skill")
+                        uninstall_dropdown = gr.Dropdown(
+                            label="选择要卸载的 Skill",
+                            choices=_list_skill_names(),
+                            value=None,
+                        )
+                        uninstall_btn = gr.Button("卸载 Skill", variant="stop")
+                        uninstall_status = gr.Markdown("")
+
                     with gr.Column(scale=2):
                         gr.Markdown("### 已安装 Skills")
                         refresh_btn = gr.Button("🔄 刷新列表", size="sm")
@@ -264,11 +314,16 @@ def create_app():
                 install_btn.click(
                     on_skill_upload,
                     inputs=[skill_file_input],
-                    outputs=[install_status, skills_list],
+                    outputs=[install_status, skills_list, uninstall_dropdown],
+                )
+                uninstall_btn.click(
+                    on_skill_uninstall,
+                    inputs=[uninstall_dropdown],
+                    outputs=[uninstall_status, skills_list, uninstall_dropdown],
                 )
                 refresh_btn.click(
                     on_skill_refresh,
-                    outputs=[skills_list],
+                    outputs=[skills_list, uninstall_dropdown],
                 )
 
     return demo

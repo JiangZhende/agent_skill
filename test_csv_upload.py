@@ -10,6 +10,7 @@
   5. cleanup 把 outputs/ 持久化到 ./test_outputs/
   6. 断言 Excel 文件存在且非空
 """
+import os
 import shutil
 import sys
 import tempfile
@@ -53,10 +54,10 @@ def run():
     print("=" * 60)
 
     agent = build_agent(
-        model_id="Pro/zai-org/GLM-5.1",
-        api_base="https://api.siliconflow.cn/v1/",
-        api_key="sk-sptwlpbrnycnelnftjzvfwgdhlznnbgvrimiuzqairsstjou",
-        skills_dir=PROJECT_ROOT / "skills",
+        model_id=os.getenv("MODEL_ID", "Pro/zai-org/GLM-5.1"),
+        api_base=os.getenv("API_BASE", "https://api.siliconflow.cn/v1/"),
+        api_key=os.getenv("API_KEY"),
+        skills_dir=Path(os.getenv("SKILLS_DIR", str(PROJECT_ROOT / "skills"))),
         extra_tools=ALL_TOOLS,
         upload_files=[csv_path],
         outputs_persist_to=outputs_dir,

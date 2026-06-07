@@ -17,6 +17,10 @@ trajectories/
 .DS_Store
 *.tmp
 
+# 环境变量（含 API Key，禁止提交）
+.env
+.env.local
+
 # 测试文件
 test_skills/
-skills/echo_test/
+test_*.py

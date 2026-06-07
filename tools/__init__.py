@@ -4,6 +4,4 @@
 它们由 build_agent 自动装配。本文件只放业务方自己的 tool。
 """
 
-from tools.web_search import web_search
-
-ALL_TOOLS = [web_search]
+ALL_TOOLS = []
