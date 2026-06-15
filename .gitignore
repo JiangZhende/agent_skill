@@ -9,6 +9,7 @@ __pycache__/
 # 运行产物（本地测试用，不提交）
 test_outputs/
 trajectory_outputs/
+workspaces/
 
 # Trajectory（运行时生成，数据量大）
 trajectories/

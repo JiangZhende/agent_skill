@@ -34,7 +34,8 @@ class Workspace:
         max_total_size: int = DEFAULT_MAX_TOTAL_SIZE,
     ):
         self.run_id = run_id or f"run_{uuid.uuid4().hex[:8]}"
-        self.root = Path.home() / ".agent_workspaces" / f"agent_{self.run_id}"
+        _project_root = Path(__file__).parent.parent
+        self.root = _project_root / "workspaces" / f"agent_{self.run_id}"
         self.inputs_dir = self.root / "inputs"
         self.workspace_dir = self.root / "workspace"
         self.outputs_dir = self.root / "outputs"

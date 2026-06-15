@@ -14,6 +14,7 @@ from core.skill_loader import SkillRegistry
 from core.workspace import Workspace
 from tools.run_script import make_run_script_tool
 from tools.load_skill import make_load_skill_tool
+from tools.read_resource import make_read_resource_tool
 from tools.workspace_tool import make_workspace_tools
 
 
@@ -78,6 +79,7 @@ Before responding to ANY user query, follow this checklist:
   - `args`: CLI argument **array**, e.g. `["--region", "华南", "--quarter", "2025Q3"]`
   - `input`: Pass data directly via stdin (use this when you have data in memory, e.g. JSON string from a previous step)
   - **Note**: `args` MUST be a JSON array `[...]`, never an object `{{...}}`
+- `read_resource(skill_name, path)`: Read a resource file inside a skill directory (schema, template, lookup table, etc.). Only call when the skill instructions explicitly reference a resource file.
 """
 
 
@@ -120,9 +122,10 @@ def build_agent(
         registry, skills_dir, workspace=workspace,
         use_docker=use_docker, docker_image=docker_image,
     )
+    read_resource_tool = make_read_resource_tool(registry, skills_dir)
     workspace_tools = make_workspace_tools(workspace)
 
-    builtin_tools = [load_skill_tool, run_script_tool] + workspace_tools
+    builtin_tools = [load_skill_tool, run_script_tool, read_resource_tool] + workspace_tools
 
     model = OpenAIServerModel(model_id=model_id, api_base=api_base, api_key=api_key)
     agent = ToolCallingAgent(

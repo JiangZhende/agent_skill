@@ -330,10 +330,15 @@ def create_app():
 
 
 def main():
+    global SKILLS_DIR
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--share", action="store_true")
+    parser.add_argument("--skills-dir", type=Path, default=None, help="覆盖默认 skills 目录")
     args = parser.parse_args()
+
+    if args.skills_dir:
+        SKILLS_DIR = args.skills_dir.resolve()
 
     create_app().launch(server_port=args.port, share=args.share)
 
