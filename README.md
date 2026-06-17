@@ -25,7 +25,7 @@ agent_skills_poc/
 ├── trajectories/           # 每次运行的 JSONL 轨迹（自动生成）
 ├── Dockerfile              # Docker 沙箱镜像
 ├── app.py                  # Gradio Web UI
-└── test.py                 # CLI 入口
+└── main.py                 # CLI 入口（单次任务，无 UI）
 ```
 
 ## 范式选择：为什么是 ToolCallingAgent
@@ -52,7 +52,7 @@ agent_skills_poc/
 ## 快速开始
 
 ```bash
-pip install smolagents pyyaml gradio openpyxl requests beautifulsoup4 trafilatura ddgs python-dotenv
+pip install -r requirements.txt
 
 # 配置 API Key
 cp .env.example .env
@@ -114,7 +114,7 @@ docker build -t agent-sandbox:latest .
 |------|------|
 | 多轮对话 | 同一 session 保持上下文，"新对话"按钮重置 |
 | 文件上传 | 上传后通过 `@input:<filename>` 供 skill 脚本引用；同一 session 内新上传文件会提示模型当前轮新文件名 |
-| 流式输出 | 每个 step 完成后即时推送到界面 |
+| 流式输出 | 工具调用步骤完成后即时推送；`final_answer` 回答内容 token 级逐字流式显示 |
 | 产物下载 | skill 生成的文件（Excel、报告等）可直接点击下载 |
 | 模型配置 | 展开"⚙️ 模型配置"可修改 Model ID / API Base URL / API Key（点"新对话"生效） |
 
@@ -143,14 +143,14 @@ my_skill.zip
 测试文件使用 `test_skills/` 目录（已 gitignore）：
 
 ```bash
-# 全量测试（需要 smolagents 在 path 中）
-PYTHONPATH="/Users/likun/code/deepresearch:$PYTHONPATH" python -m pytest test_sandbox.py -v
+# 全量测试
+python -m pytest test_sandbox.py -v
 
 # 只跑 read_resource 相关
-PYTHONPATH="/Users/likun/code/deepresearch:$PYTHONPATH" python -m pytest test_sandbox.py::TestReadResource test_sandbox.py::TestRegionLookupScript -v
+python -m pytest test_sandbox.py::TestReadResource test_sandbox.py::TestRegionLookupScript -v
 
 # 只跑 Docker 相关（需要 Docker 运行中）
-PYTHONPATH="/Users/likun/code/deepresearch:$PYTHONPATH" python -m pytest test_sandbox.py::TestDockerReal -v
+python -m pytest test_sandbox.py::TestDockerReal -v
 ```
 
 ## Trajectory 格式
@@ -162,7 +162,7 @@ PYTHONPATH="/Users/likun/code/deepresearch:$PYTHONPATH" python -m pytest test_sa
 {"type": "task",          "run_id": "...", "timestamp": "...", "task": "..."}
 {"type": "tool_call",     "run_id": "...", "step": 1, "tool": "load_skill",           "args": {...}, "duration": 1.2}
 {"type": "observation",   "run_id": "...", "step": 1, "content": "..."}
-{"type": "tool_call",     "run_id": "...", "step": 2, "tool": "execute_skill_script", "args": {...}, "duration": 3.4}
+{"type": "tool_call",     "run_id": "...", "step": 2, "tool": "execute_skill_script", "args": {...}, "duration": 3.4}  // duration 可为 null（步骤异常退出时）
 {"type": "observation",   "run_id": "...", "step": 2, "content": "..."}
 {"type": "final_answer",  "run_id": "...", "step": 3, "content": "..."}
 ```
