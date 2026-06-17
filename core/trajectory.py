@@ -66,7 +66,7 @@ def save(agent, task: str, trajectories_dir: Path = Path("trajectories")) -> Pat
                         "step": step_num,
                         "tool": tc.name,
                         "args": tc.arguments if isinstance(tc.arguments, dict) else {},
-                        "duration": step.duration,
+                        "duration": step.timing.duration if step.timing else None,
                     })
 
             if step.error:

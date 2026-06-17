@@ -132,6 +132,7 @@ def build_agent(
         tools=builtin_tools + (extra_tools or []),
         model=model,
         max_steps=max_steps,
+        stream_outputs=True,
     )
 
     # 完全替换 smolagents 默认模板，使用纯中文自定义模板
@@ -149,66 +150,36 @@ def build_agent(
     agent.cleanup = cleanup_all
     agent.workspace = workspace
 
-    # get_facts 是此 fork 特有功能：每次 tool 返回后额外调用模型提炼 observation。
-    # 问题：(1) 每步增加一次模型调用，延迟高；(2) 在强制 JSON tool call 的 system prompt 下
-    # 模型返回 content=None，导致 observations 显示为空。
-    # 直接 bypass：原样返回 observation 内容。
-    if hasattr(agent, "get_facts"):
-        import types
-        # 不调用原始 get_facts（它把 content 提前提取成字符串，丢失了 tool_calls）
-        # 直接调模型拿完整 ChatMessage，兼容 content=None 而答案在 tool_calls 里的情况
-        def _get_facts_fixed(*args):
-            return args[-1]
-        agent.get_facts = types.MethodType(_get_facts_fixed, agent)
-
-    # smolagents 本地 fork 的 get_facts 把 input_messages 构建成 dict 而非 list，
-    # 导致 get_clean_message_list 迭代时报 TypeError: string indices must be integers。
-    # 用 proxy 包装 agent.model，把 dict 自动升级为 list，不修改依赖源码。
-    if hasattr(agent, "get_facts"):
-        class _ModelProxy:
-            def __init__(self, m):
-                self._m = m
-            def __call__(self, messages, **kw):
-                if isinstance(messages, dict):
-                    messages = [messages]
-                return self._m(messages, **kw)
-            def __getattr__(self, name):
-                return getattr(self._m, name)
-        agent.model = _ModelProxy(agent.model)
-
-    # 当 postprocess_message 解析 JSON tool call 失败时：
+    # 当 parse_tool_calls 解析 JSON tool call 失败时：
     # 1. 打印模型原始输出方便排查
     # 2. 若模型直接返回自然语言（未调用任何 tool），降级为 final_answer 而非崩溃
-    _inner_model = agent.model._m if hasattr(agent.model, "_m") else agent.model
-    _orig_postprocess = _inner_model.postprocess_message
-    def _postprocess_with_log(message, tools_to_call_from=None):
+    import sys, uuid
+    from smolagents.models import ChatMessage, ChatMessageToolCall, ChatMessageToolCallFunction
+    _orig_parse = agent.model.parse_tool_calls
+    def _parse_tool_calls_with_fallback(message):
         try:
-            return _orig_postprocess(message, tools_to_call_from)
+            return _orig_parse(message)
         except Exception as e:
-            import sys, uuid
             print(
                 f"\n[model parse error] {type(e).__name__}: {e}\n"
                 f"[model raw output]:\n{message.content}\n",
                 file=sys.stderr,
             )
-            # 模型返回纯文本而非 JSON tool call，降级为 final_answer
-            if message.content and message.tool_calls is None:
-                # 从已加载的模块里取类型，不写 import 语句（smolagents 是本地路径，IDE 无法静态解析）
-                _models = sys.modules[type(message).__module__]
-                _CM  = type(message)
-                _TC  = _models.ChatMessageToolCall
-                _TCD = _models.ChatMessageToolCallDefinition
-                return _CM(
+            if message.content and not message.tool_calls:
+                return ChatMessage(
                     role=message.role,
                     content=None,
-                    tool_calls=[_TC(
+                    tool_calls=[ChatMessageToolCall(
                         id=f"fallback_{uuid.uuid4().hex[:8]}",
                         type="function",
-                        function=_TCD(name="final_answer", arguments={"answer": message.content}),
+                        function=ChatMessageToolCallFunction(
+                            name="final_answer",
+                            arguments={"answer": message.content},
+                        ),
                     )],
                     raw=message.raw,
                 )
             raise
-    _inner_model.postprocess_message = _postprocess_with_log
+    agent.model.parse_tool_calls = _parse_tool_calls_with_fallback
 
     return agent

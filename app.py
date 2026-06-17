@@ -7,7 +7,9 @@ Gradio 前端：skills-based agent web UI
     python app.py --share
     python app.py --port 7861
 """
+import json
 import os
+import re
 import sys
 import argparse
 import tempfile
@@ -16,16 +18,15 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
-_SMOLAGENTS_DEV = Path.home() / "code" / "deepresearch"
-if _SMOLAGENTS_DEV.exists() and str(_SMOLAGENTS_DEV) not in sys.path:
-    sys.path.insert(0, str(_SMOLAGENTS_DEV))
 
-from smolagents.gradio_ui import stream_to_gradio
 from core.agent import build_agent
 from core import trajectory as traj_recorder
 from core.skill_installer import install_from_zip, install_from_skill_md, uninstall_skill
 from core.skill_loader import SkillRegistry
 from tools import ALL_TOOLS
+from smolagents.memory import ActionStep, PlanningStep, FinalAnswerStep
+from smolagents.gradio_ui import pull_messages_from_step
+from smolagents.models import ChatMessageStreamDelta, agglomerate_stream_deltas
 
 try:
     from dotenv import load_dotenv
@@ -72,6 +73,50 @@ def _list_skills_md() -> str:
 def _list_skill_names() -> list[str]:
     """返回已安装的 skill 名称列表，供下拉框使用。"""
     return sorted(SkillRegistry(SKILLS_DIR).skills.keys())
+
+
+def _extract_final_answer_stream(accumulated: list[ChatMessageStreamDelta]) -> str:
+    """从累积的 ChatMessageStreamDelta 中提取 final_answer 的 answer 文本。
+    支持 native tool call（delta.tool_calls）和 content JSON 两种模型输出路径。
+    """
+    msg = agglomerate_stream_deltas(accumulated)
+
+    # native tool call 路径：arguments 在 tool_calls 里
+    if msg.tool_calls:
+        tc = msg.tool_calls[0]
+        if tc.function.name == "final_answer":
+            raw_args = tc.function.arguments or ""
+            # 尝试解析完整 JSON
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                return args.get("answer", "") if isinstance(args, dict) else ""
+            except json.JSONDecodeError:
+                # 部分截断：从原始字符串提取 answer 值
+                m = re.search(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)', raw_args)
+                if m:
+                    partial = m.group(1)
+                    partial = re.sub(r'\\u([0-9a-fA-F]{4})', lambda x: chr(int(x.group(1), 16)), partial)
+                    return partial.replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\")
+        return f"🔧 {tc.function.name}..."
+
+    # content JSON 路径：模型把 JSON tool call 输出在 content 里
+    if msg.content:
+        content = msg.content.strip()
+        if not content.startswith("{"):
+            return content
+        tool_m = re.search(r'"(?:name|tool)"\s*:\s*"([^"]+)"', content)
+        if not tool_m or tool_m.group(1) != "final_answer":
+            return f"🔧 {tool_m.group(1)}..." if tool_m else ""
+        m = re.search(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)', content)
+        if m:
+            partial = m.group(1)
+            try:
+                return json.loads(f'"{partial}"')
+            except json.JSONDecodeError:
+                partial = re.sub(r'\\u([0-9a-fA-F]{4})', lambda x: chr(int(x.group(1), 16)), partial)
+                return partial.replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\")
+
+    return ""
 
 
 def create_app():
@@ -131,8 +176,30 @@ def create_app():
         yield history, session, gr.update(visible=False)
 
         try:
-            for msg in stream_to_gradio(agent, task=task, reset_agent_memory=reset_memory):
-                history.append(msg)
+            accumulated_deltas: list[ChatMessageStreamDelta] = []
+            streaming_idx = None  # index of the current streaming placeholder in history
+            for event in agent.run(task, stream=True, reset=reset_memory):
+                if isinstance(event, ChatMessageStreamDelta):
+                    accumulated_deltas.append(event)
+                    content = _extract_final_answer_stream(accumulated_deltas)
+                    if not content:
+                        yield history, session, gr.update(visible=False)
+                        continue
+                    placeholder = {"role": "assistant", "content": content}
+                    if streaming_idx is None:
+                        history.append(placeholder)
+                        streaming_idx = len(history) - 1
+                    else:
+                        history[streaming_idx] = placeholder
+                elif isinstance(event, (ActionStep, PlanningStep, FinalAnswerStep)):
+                    accumulated_deltas = []
+                    if streaming_idx is not None:
+                        history.pop(streaming_idx)
+                        streaming_idx = None
+                    for msg in pull_messages_from_step(
+                        event, skip_model_outputs=getattr(agent, "stream_outputs", False)
+                    ):
+                        history.append({"role": msg.role, "content": msg.content, **({"metadata": msg.metadata} if msg.metadata else {})})
                 yield history, session, gr.update(visible=False)
         finally:
             traj_recorder.save(agent, task, PROJECT_ROOT / "trajectories")
