@@ -46,6 +46,12 @@ def make_run_script_tool(registry, skills_dir, workspace=None, use_docker=False,
     skills_root = Path(skills_dir).resolve()
     shared_cache = {}
     shared_tempdir = Path(tempfile.mkdtemp(prefix="agent_run_"))
+
+    # 持久容器状态（每个 session/agent 实例独享）
+    _container_state = {"id": None}
+    _container_lock = threading.Lock()
+    _installed_skill_reqs: set = set()  # 已在容器内安装过 requirements 的 skill
+
     def _ensure_image():
         """镜像不存在时自动 build，模块级锁防止多用户并发重复构建。"""
         if docker_image in _built_images:
@@ -72,50 +78,69 @@ def make_run_script_tool(registry, skills_dir, workspace=None, use_docker=False,
                 print(f"[sandbox] 镜像构建完成：{docker_image}", flush=True)
             _built_images.add(docker_image)
 
+    def _get_or_start_container():
+        """返回持久容器 ID，不存在时启动一个新容器。"""
+        if _container_state["id"] is not None:
+            return _container_state["id"]
+        with _container_lock:
+            if _container_state["id"] is not None:
+                return _container_state["id"]
+            _ensure_image()
+            project_root = skills_root.parent
+            cmd = [
+                "docker", "run", "-d", "--rm",
+                "--memory=512m",
+                "--cpus=0.5",
+                "--pids-limit=100",
+                "--security-opt=no-new-privileges",
+                "--cap-drop=ALL",
+                "--workdir=/app",
+                "-v", f"{project_root}:/app:ro",
+            ]
+            if workspace is not None:
+                cmd += [
+                    "-v", f"{workspace.root}:/agent_workspace:rw",
+                    "-e", "AGENT_INPUTS_DIR=/agent_workspace/inputs",
+                    "-e", "AGENT_WORKSPACE_DIR=/agent_workspace/workspace",
+                    "-e", "AGENT_OUTPUTS_DIR=/agent_workspace/outputs",
+                ]
+            cmd += [docker_image, "tail", "-f", "/dev/null"]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            _container_state["id"] = result.stdout.decode().strip()
+            print(f"[sandbox] 持久容器已启动: {_container_state['id'][:12]}", flush=True)
+            return _container_state["id"]
+
+    def _ensure_skill_reqs(container_id, skill_name):
+        """首次使用某 skill 时在容器内安装其 requirements.txt（仅执行一次）。"""
+        if skill_name in _installed_skill_reqs:
+            return
+        req_file = skills_root / skill_name / "requirements.txt"
+        if req_file.exists():
+            project_root = skills_root.parent
+            req_in_container = f"/app/{req_file.relative_to(project_root)}"
+            print(f"[sandbox] 安装 {skill_name} 依赖...", flush=True)
+            subprocess.run(
+                ["docker", "exec", container_id,
+                 "pip", "install", "-q",
+                 "-i", "https://pypi.tuna.tsinghua.edu.cn/simple",
+                 "-r", req_in_container],
+                check=False,
+            )
+        _installed_skill_reqs.add(skill_name)
+
     def _docker_run(resolved_path, argv, stdin_bytes, timeout):
-        """在 Docker 容器内执行脚本，挂载 skills 目录和 workspace。"""
-        _ensure_image()
+        """通过持久容器执行脚本，消除每次 docker run 的冷启动开销。"""
+        container_id = _get_or_start_container()
         project_root = skills_root.parent
         script_in_container = f"/app/{resolved_path.relative_to(project_root)}"
 
-        cmd = [
-            "docker", "run", "--rm",
-            "--memory=512m",
-            "--cpus=0.5",
-            "--pids-limit=100",
-            "--security-opt=no-new-privileges",
-            "--cap-drop=ALL",
-            "--workdir=/app",
-            "-v", f"{project_root}:/app:ro",
-        ]
+        skill_name = resolved_path.relative_to(skills_root).parts[0]
+        _ensure_skill_reqs(container_id, skill_name)
 
+        cmd = ["docker", "exec"]
         if stdin_bytes:
             cmd.append("-i")
-
-        if workspace is not None:
-            cmd += [
-                "-v", f"{workspace.root}:/agent_workspace:rw",
-                "-e", "AGENT_INPUTS_DIR=/agent_workspace/inputs",
-                "-e", "AGENT_WORKSPACE_DIR=/agent_workspace/workspace",
-                "-e", "AGENT_OUTPUTS_DIR=/agent_workspace/outputs",
-            ]
-
-        # 如果 skill 有 requirements.txt，先 pip install 再执行脚本
-        skill_name = resolved_path.relative_to(skills_root).parts[0]
-        req_file = skills_root / skill_name / "requirements.txt"
-        if req_file.exists():
-            req_in_container = f"/app/{req_file.relative_to(project_root)}"
-            entrypoint = (
-                f"pip install -q -i https://pypi.tuna.tsinghua.edu.cn/simple "
-                f"-r {req_in_container} && python {script_in_container} "
-                + " ".join(f'"{a}"' for a in argv)
-            )
-            cmd += [docker_image, "sh", "-c", entrypoint]
-            argv = []  # 参数已拼入 entrypoint
-        else:
-            cmd += [docker_image, "python", script_in_container]
-
-        cmd += argv
+        cmd += [container_id, "python", script_in_container] + argv
 
         return subprocess.run(
             cmd,
@@ -311,6 +336,15 @@ def make_run_script_tool(registry, skills_dir, workspace=None, use_docker=False,
         return "\n".join(parts)
 
     def cleanup():
+        # 停止持久容器（--rm 会自动删除）
+        if _container_state["id"]:
+            subprocess.run(
+                ["docker", "stop", _container_state["id"]],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            )
+            print(f"[sandbox] 容器已停止: {_container_state['id'][:12]}", flush=True)
+            _container_state["id"] = None
+
         for p in shared_cache.values():
             try:
                 p.unlink(missing_ok=True)
