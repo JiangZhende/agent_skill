@@ -6,6 +6,7 @@ SKILL.md 格式：
     name: <skill_name>
     description: <when to use>
     triggers: [...]
+    network: true        # 可选，脚本需要联网时声明；默认断网
     ---
 
     # <Skill 标题>
@@ -30,6 +31,7 @@ class SkillMeta:
     name: str
     description: str
     triggers: list = field(default_factory=list)
+    network: bool = False  # 沙箱内是否允许联网
 
 
 class Skill:
@@ -68,6 +70,7 @@ class Skill:
             name=name,
             description=description,
             triggers=fm.get("triggers", []) or [],
+            network=fm.get("network") is True,
         )
 
         return meta, content.strip()

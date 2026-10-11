@@ -153,7 +153,7 @@ def _run_agent_thread(agent, task: str, reset: bool, queue: asyncio.Queue, loop:
                     asyncio.run_coroutine_threadsafe(queue.put(payload), loop).result()
 
                 if isinstance(event, FinalAnswerStep):
-                    final_answer = str(event.answer) if hasattr(event, "answer") else None
+                    final_answer = str(event.output) if event.output is not None else None
 
     except Exception as e:
         asyncio.run_coroutine_threadsafe(
@@ -192,6 +192,9 @@ async def _event_stream(session: dict, session_id: str, task: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if USE_DOCKER:
+        from core.executor import cleanup_orphans
+        cleanup_orphans()  # 上次进程崩溃后遗留的沙箱容器
     yield
     # 关闭时清理所有 session
     with _sessions_lock:

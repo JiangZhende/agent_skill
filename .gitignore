@@ -25,3 +25,6 @@ trajectories/
 # 测试文件
 test_skills/
 test_*.py
+
+# 编辑器扩展安装包
+*.vsix

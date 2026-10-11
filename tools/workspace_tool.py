@@ -26,9 +26,9 @@ def make_workspace_tools(workspace):
         files = workspace.list_outputs()
         if not files:
             return "（还没有任何输出文件）"
-        lines = ["已生成的输出文件："]
+        lines = ["已生成的输出文件（使用 @output:<filename> 引用）："]
         for f in files:
-            lines.append(f"  - {f['name']} ({f['size_human']}) at {f['path']}")
+            lines.append(f"  - {f['name']} ({f['size_human']})")
         return "\n".join(lines)
 
     return [list_inputs, list_outputs]

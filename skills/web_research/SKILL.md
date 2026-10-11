@@ -8,6 +8,7 @@ triggers:
   - 调研
   - 最新信息
   - 网页内容
+network: true
 ---
 
 # Web 深度调研

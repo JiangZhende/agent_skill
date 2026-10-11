@@ -12,6 +12,7 @@ from smolagents import ToolCallingAgent, OpenAIServerModel
 
 from core.skill_loader import SkillRegistry
 from core.workspace import Workspace
+from core.executor import make_executor
 from tools.run_script import make_run_script_tool
 from tools.load_skill import make_load_skill_tool
 from tools.read_resource import make_read_resource_tool
@@ -105,6 +106,7 @@ def build_agent(
     Args:
         upload_files: 用户上传的文件列表
         outputs_persist_to: 持久化 outputs 的目标目录
+        use_docker: True 则脚本在 Docker 沙箱内执行；False 为本机子进程（仅开发）
     """
     registry = SkillRegistry(skills_dir)
     workspace = Workspace()
@@ -118,9 +120,9 @@ def build_agent(
                 print(f"[upload error] {f}: {e}")
 
     load_skill_tool = make_load_skill_tool(registry)
+    executor = make_executor(use_docker=use_docker, docker_image=docker_image, workspace=workspace)
     run_script_tool, run_script_cleanup = make_run_script_tool(
-        registry, skills_dir, workspace=workspace,
-        use_docker=use_docker, docker_image=docker_image,
+        registry, skills_dir, workspace=workspace, executor=executor,
     )
     read_resource_tool = make_read_resource_tool(registry, skills_dir)
     workspace_tools = make_workspace_tools(workspace)

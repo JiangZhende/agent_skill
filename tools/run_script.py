@@ -10,27 +10,41 @@
   )
 
 框架在内部:
-1. 安全校验：skill 存在、script 路径在 skill 目录内
+1. 安全校验：skill 存在、script 路径在 skill 目录内、参数不带宿主机路径
 2. 解析 args 列表中的 @input:/@output:/@workspace:/@result_id 引用
-3. subprocess 执行，stdout/stderr/exit_code 返回给模型
+3. 交给 SandboxExecutor 执行（见 core/executor.py），stdout/stderr/exit_code 返回给模型
 4. 缓存 stdout 为 result_id，供后续步骤用 @<result_id> 引用
 """
+import os
 import re
-import subprocess
-import sys
-import threading
-import tempfile
 import uuid
-from pathlib import Path
-from typing import List, Optional
+from pathlib import Path, PurePosixPath
+from typing import List
 
 from smolagents import tool
 
-# 模块级：跨所有 agent 实例共享，防止并发重复构建同一镜像
-_built_images: set = set()
-_build_lock = threading.Lock()
+from core.executor import LocalExecutor, MAX_OUTPUT_BYTES
 
-def make_run_script_tool(registry, skills_dir, workspace=None, use_docker=False, docker_image="agent-sandbox:latest"):
+# 超时由服务端封顶，模型传入的值只能在此范围内
+MAX_TIMEOUT = int(os.getenv("SANDBOX_MAX_TIMEOUT", "300"))
+
+
+def _unsafe_path_arg(value: str) -> bool:
+    """参数是否像一个指向沙箱外的路径（绝对路径、~ 或含 ..）。文件只能通过 @ 引用传入。"""
+    candidates = [value]
+    if value.startswith("-") and "=" in value:  # --flag=value 形式
+        candidates.append(value.split("=", 1)[1])
+    for v in candidates:
+        if v.startswith(("http://", "https://")):
+            continue
+        if v.startswith(("/", "~")) or re.match(r"^[A-Za-z]:[\\/]", v):
+            return True
+        if ".." in PurePosixPath(v.replace("\\", "/")).parts:
+            return True
+    return False
+
+
+def make_run_script_tool(registry, skills_dir, workspace=None, executor=None):
     """
     工厂：返回单个 execute_skill_script tool + cleanup 函数。
 
@@ -38,118 +52,14 @@ def make_run_script_tool(registry, skills_dir, workspace=None, use_docker=False,
         registry: SkillRegistry
         skills_dir: skills 根目录
         workspace: 可选 Workspace 实例（用于 @ 引用解析）
-        use_docker: True 则在 Docker 容器内执行脚本，False 用本地 subprocess（默认）
-        docker_image: Docker 镜像名，use_docker=True 时生效
+        executor: SandboxExecutor；不传则用 LocalExecutor（本机子进程，仅开发用）
 
     Returns: (execute_skill_script_tool, cleanup_fn)
     """
     skills_root = Path(skills_dir).resolve()
+    if executor is None:
+        executor = LocalExecutor(workspace=workspace)
     shared_cache = {}
-    shared_tempdir = Path(tempfile.mkdtemp(prefix="agent_run_"))
-
-    # 持久容器状态（每个 session/agent 实例独享）
-    _container_state = {"id": None}
-    _container_lock = threading.Lock()
-    _installed_skill_reqs: set = set()  # 已在容器内安装过 requirements 的 skill
-
-    def _ensure_image():
-        """镜像不存在时自动 build，模块级锁防止多用户并发重复构建。"""
-        if docker_image in _built_images:
-            return
-        with _build_lock:
-            if docker_image in _built_images:  # 双重检查
-                return
-            check = subprocess.run(
-                ["docker", "image", "inspect", docker_image],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            if check.returncode != 0:
-                dockerfile_dir = skills_root.parent
-                print(f"[sandbox] 镜像 {docker_image} 不存在，正在自动构建...", flush=True)
-                build = subprocess.run(
-                    ["docker", "build", "-t", docker_image, str(dockerfile_dir)],
-                    check=False,
-                )
-                if build.returncode != 0:
-                    raise RuntimeError(
-                        f"镜像构建失败（exit {build.returncode}）。"
-                        f"请手动运行: docker build -t {docker_image} {dockerfile_dir}"
-                    )
-                print(f"[sandbox] 镜像构建完成：{docker_image}", flush=True)
-            _built_images.add(docker_image)
-
-    def _get_or_start_container():
-        """返回持久容器 ID，不存在时启动一个新容器。"""
-        if _container_state["id"] is not None:
-            return _container_state["id"]
-        with _container_lock:
-            if _container_state["id"] is not None:
-                return _container_state["id"]
-            _ensure_image()
-            project_root = skills_root.parent
-            cmd = [
-                "docker", "run", "-d", "--rm",
-                "--memory=512m",
-                "--cpus=0.5",
-                "--pids-limit=100",
-                "--security-opt=no-new-privileges",
-                "--cap-drop=ALL",
-                "--workdir=/app",
-                "-v", f"{project_root}:/app:ro",
-            ]
-            if workspace is not None:
-                cmd += [
-                    "-v", f"{workspace.root}:/agent_workspace:rw",
-                    "-e", "AGENT_INPUTS_DIR=/agent_workspace/inputs",
-                    "-e", "AGENT_WORKSPACE_DIR=/agent_workspace/workspace",
-                    "-e", "AGENT_OUTPUTS_DIR=/agent_workspace/outputs",
-                ]
-            cmd += [docker_image, "tail", "-f", "/dev/null"]
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-            _container_state["id"] = result.stdout.decode().strip()
-            print(f"[sandbox] 持久容器已启动: {_container_state['id'][:12]}", flush=True)
-            return _container_state["id"]
-
-    def _ensure_skill_reqs(container_id, skill_name):
-        """首次使用某 skill 时在容器内安装其 requirements.txt（仅执行一次）。"""
-        if skill_name in _installed_skill_reqs:
-            return
-        req_file = skills_root / skill_name / "requirements.txt"
-        if req_file.exists():
-            project_root = skills_root.parent
-            req_in_container = f"/app/{req_file.relative_to(project_root)}"
-            print(f"[sandbox] 安装 {skill_name} 依赖...", flush=True)
-            subprocess.run(
-                ["docker", "exec", container_id,
-                 "pip", "install", "-q",
-                 "-i", "https://pypi.tuna.tsinghua.edu.cn/simple",
-                 "-r", req_in_container],
-                check=False,
-            )
-        _installed_skill_reqs.add(skill_name)
-
-    def _docker_run(resolved_path, argv, stdin_bytes, timeout):
-        """通过持久容器执行脚本，消除每次 docker run 的冷启动开销。"""
-        container_id = _get_or_start_container()
-        project_root = skills_root.parent
-        script_in_container = f"/app/{resolved_path.relative_to(project_root)}"
-
-        skill_name = resolved_path.relative_to(skills_root).parts[0]
-        _ensure_skill_reqs(container_id, skill_name)
-
-        cmd = ["docker", "exec"]
-        if stdin_bytes:
-            cmd.append("-i")
-        cmd += [container_id, "python", script_in_container] + argv
-
-        return subprocess.run(
-            cmd,
-            input=stdin_bytes,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
-        )
 
     def _resolve_script(skill_name, script_path):
         """安全解析脚本路径，必须在 skills/<skill_name>/ 子目录下"""
@@ -176,31 +86,19 @@ def make_run_script_tool(registry, skills_dir, workspace=None, use_docker=False,
             rid = m.group(1)
             if rid not in shared_cache:
                 return None, f"result_id 不存在: {rid}"
-            return str(shared_cache[rid]), None
+            return executor.path_for(shared_cache[rid]), None
 
         if value.startswith("@") and workspace is not None:
             host_path, err = workspace.resolve_ref(value)
-            if err or not use_docker:
+            if err or host_path == value:  # 出错，或不是已知引用（原样返回）
                 return host_path, err
-            # Docker 模式：把宿主机路径转换为容器内挂载路径
-            host_path = Path(host_path)
-            for host_dir, container_dir in (
-                (workspace.inputs_dir,   "/agent_workspace/inputs"),
-                (workspace.workspace_dir, "/agent_workspace/workspace"),
-                (workspace.outputs_dir,  "/agent_workspace/outputs"),
-            ):
-                try:
-                    rel = host_path.relative_to(host_dir)
-                    return f"{container_dir}/{rel}", None
-                except ValueError:
-                    continue
-            return str(host_path), None  # 无法映射，原样返回
+            return executor.path_for(host_path), None
 
         return value, None
 
     def _cache_stdout(stdout):
         rid = f"r_{uuid.uuid4().hex[:8]}"
-        p = shared_tempdir / f"{rid}.json"
+        p = executor.results_dir / f"{rid}.json"
         p.write_text(stdout, encoding="utf-8")
         shared_cache[rid] = p
         return rid
@@ -234,7 +132,7 @@ def make_run_script_tool(registry, skills_dir, workspace=None, use_docker=False,
             script_path: 脚本相对路径，如 "scripts/fetch_sales.py"
             args: CLI 参数数组，如 ["--region", "华南", "--quarter", "2025Q3"]
             input: 通过 stdin 管道传给脚本的原始字符串
-            timeout: 超时秒数，默认 60
+            timeout: 超时秒数，默认 60，上限由服务端决定
         """
         # 1. skill 必须存在
         if skill_name not in registry.skills:
@@ -246,49 +144,51 @@ def make_run_script_tool(registry, skills_dir, workspace=None, use_docker=False,
         if err:
             return f"[错误] {err}"
 
-        # 3. 解析 args 中的 @ 引用
+        # 3. 解析 args 中的 @ 引用；其余参数不允许带沙箱外的路径
         argv = []
         ref_errors = []
         for item in (args or []):
-            resolved, ref_err = _resolve_ref(str(item))
+            item = str(item)
+            if not item.startswith("@") and _unsafe_path_arg(item):
+                ref_errors.append(
+                    f"{item!r} → 不允许传入绝对路径或含 '..' 的路径，"
+                    f"文件请用 @input:/@workspace:/@output: 引用，skill 内资源用相对路径"
+                )
+                continue
+            resolved, ref_err = _resolve_ref(item)
             if ref_err:
                 ref_errors.append(f"{item!r} → {ref_err}")
                 continue
-            argv.append(resolved if resolved is not None else str(item))
+            argv.append(resolved if resolved is not None else item)
 
         if ref_errors:
             return "[参数引用失败]\n" + "\n".join(ref_errors)
 
-        # 4. 注入环境变量（仅 subprocess 路径使用）
-        env = None
-        if not use_docker and workspace is not None:
-            import os
-            env = os.environ.copy()
-            env["AGENT_INPUTS_DIR"] = str(workspace.inputs_dir)
-            env["AGENT_WORKSPACE_DIR"] = str(workspace.workspace_dir)
-            env["AGENT_OUTPUTS_DIR"] = str(workspace.outputs_dir)
+        # 4. 配额已超限的会话不再执行
+        if workspace is not None:
+            q_err = workspace.check_quota()
+            if q_err:
+                return f"[配额超限] {q_err}"
 
         # 5. 执行
-        stdin_bytes = input.encode("utf-8") if input else None
         try:
-            if use_docker:
-                result = _docker_run(resolved_path, argv, stdin_bytes, timeout)
-            else:
-                cmd = [sys.executable, str(resolved_path)] + argv
-                result = subprocess.run(
-                    cmd,
-                    input=stdin_bytes,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=timeout,
-                    check=False,
-                    cwd=str(skills_root.parent),
-                    env=env,
-                )
-        except subprocess.TimeoutExpired:
-            return f"[超时] 脚本执行超过 {timeout} 秒"
+            timeout = max(1, min(int(timeout), MAX_TIMEOUT))
+        except (TypeError, ValueError):
+            timeout = 60
+        stdin_bytes = input.encode("utf-8") if input else None
+        script_rel = resolved_path.relative_to((skills_root / skill_name).resolve()).as_posix()
+        try:
+            result = executor.run(registry.skills[skill_name], script_rel, argv, stdin_bytes, timeout)
         except Exception as e:
             return f"[执行错误] {type(e).__name__}: {e}"
+
+        if result.timed_out:
+            return f"[超时] 脚本执行超过 {timeout} 秒，已终止"
+        if result.output_truncated:
+            return (
+                f"[输出超限] 脚本输出超过 {MAX_OUTPUT_BYTES // (1024 * 1024)}MB，已终止。"
+                f"大量数据请写入 @workspace: 文件而不是打印到 stdout"
+            )
 
         stdout_text = result.stdout.decode("utf-8", errors="replace")
         stderr_text = result.stderr.decode("utf-8", errors="replace")
@@ -297,19 +197,20 @@ def make_run_script_tool(registry, skills_dir, workspace=None, use_docker=False,
         if workspace is not None:
             q_err = workspace.check_quota()
             if q_err:
-                return f"[配额超限] {q_err}\n**Exit Code**: {result.returncode}"
+                executor.close()  # 停掉本会话的沙箱，后续执行会在第 4 步被拒绝
+                return f"[配额超限] {q_err}\n**Exit Code**: {result.exit_code}"
 
         # 7. 缓存 stdout
         rid = None
-        if result.returncode == 0 and stdout_text.strip():
+        if result.exit_code == 0 and stdout_text.strip():
             if len(stdout_text) <= 5 * 1024 * 1024:
                 rid = _cache_stdout(stdout_text)
 
         # 8. 组装返回（对齐 agent_skills ToolResult 格式）
         parts = [f"=== Script Execution: {skill_name}/{script_path} ===\n"]
-        if argv:
-            parts.append(f"**Arguments**: {argv}")
-        parts.append(f"**Exit Code**: {result.returncode}")
+        if args:
+            parts.append(f"**Arguments**: {[str(a) for a in args]}")
+        parts.append(f"**Exit Code**: {result.exit_code}")
         if rid:
             parts.append(
                 f"**Result ID**: {rid}"
@@ -336,25 +237,7 @@ def make_run_script_tool(registry, skills_dir, workspace=None, use_docker=False,
         return "\n".join(parts)
 
     def cleanup():
-        # 停止持久容器（--rm 会自动删除）
-        if _container_state["id"]:
-            subprocess.run(
-                ["docker", "stop", _container_state["id"]],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
-            )
-            print(f"[sandbox] 容器已停止: {_container_state['id'][:12]}", flush=True)
-            _container_state["id"] = None
-
-        for p in shared_cache.values():
-            try:
-                p.unlink(missing_ok=True)
-            except Exception:
-                pass
         shared_cache.clear()
-        try:
-            import shutil
-            shutil.rmtree(shared_tempdir, ignore_errors=True)
-        except Exception:
-            pass
+        executor.close()
 
     return execute_skill_script, cleanup

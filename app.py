@@ -407,6 +407,10 @@ def main():
     if args.skills_dir:
         SKILLS_DIR = args.skills_dir.resolve()
 
+    if USE_DOCKER:
+        from core.executor import cleanup_orphans
+        cleanup_orphans()  # 上次进程崩溃后遗留的沙箱容器
+
     create_app().launch(server_port=args.port, share=args.share)
 
 
