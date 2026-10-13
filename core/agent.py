@@ -7,6 +7,7 @@ Agent 主封装。
 - load_skill 返回值中包含该 skill 所有脚本的 run_script 调用样例
 - 业务方通过 extra_tools 注入自己的工具
 """
+from datetime import datetime
 from pathlib import Path
 from smolagents import ToolCallingAgent, OpenAIServerModel
 
@@ -23,6 +24,8 @@ from tools.workspace_tool import make_workspace_tools
 # base prompt 极简，不在 system prompt 中解释工具用法，只保留 skills 协议。
 _SYSTEM_PROMPT_TEMPLATE = """\
 你是一个能够使用工具完成用户任务的助手。
+
+当前日期：CURRENT_DATE_PLACEHOLDER。涉及"今天""最近""最新"的问题以这个日期为准。
 
 ## 输出格式（必须严格遵守）
 
@@ -140,6 +143,10 @@ def build_agent(
     # 完全替换 smolagents 默认模板，使用纯中文自定义模板
     skill_section = _build_skill_section(registry)
     custom_prompt = _SYSTEM_PROMPT_TEMPLATE.replace("SKILL_SECTION_PLACEHOLDER", skill_section)
+    # 模型自己不知道今天是哪天：不给日期的话，它会把搜到的旧网页当成"今天"的信息
+    now = datetime.now()
+    today = f"{now:%Y-%m-%d} 星期{'一二三四五六日'[now.weekday()]}"
+    custom_prompt = custom_prompt.replace("CURRENT_DATE_PLACEHOLDER", today)
     agent.prompt_templates["system_prompt"] = custom_prompt
 
     def cleanup_all():

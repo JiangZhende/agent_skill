@@ -1,10 +1,10 @@
 """
 Trajectory recorder: serializes agent.memory to JSONL after each run.
 
-File layout: trajectories/<YYYYMMDD_HHMMSS>_<task_slug>.jsonl
+File layout: trajectories/<YYYYMMDD_HHMMSS>_<task_slug>_<run_id 前 6 位>.jsonl
 Each line is one record:
   - {"type": "system_prompt","run_id", "content"}
-  - {"type": "task",         "run_id", "timestamp", "task"}
+  - {"type": "task",         "run_id", "timestamp", "task", "user", "session_id", "source"}
   - {"type": "tool_call",    "run_id", "step", "tool", "args"}
   - {"type": "observation",  "run_id", "step", "content"}
   - {"type": "error",        "run_id", "step", "content"}
@@ -23,13 +23,21 @@ def _task_slug(task: str, max_len: int = 30) -> str:
     return slug[:max_len]
 
 
-def save(agent, task: str, trajectories_dir: Path = Path("trajectories")) -> Path:
-    """Dump agent.memory to a JSONL file and return the path."""
+def save(agent, task: str, trajectories_dir: Path = Path("trajectories"),
+         user: str = None, session_id: str = None, source: str = None) -> Path:
+    """Dump agent.memory to a JSONL file and return the path.
+
+    Args:
+        user: 发起对话的用户名
+        session_id: 会话 id，同一会话的多轮对话共用
+        source: 入口，"web" 或 "api"
+    """
     trajectories_dir.mkdir(parents=True, exist_ok=True)
 
     run_id = uuid.uuid4().hex[:12]
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{ts}_{_task_slug(task)}.jsonl"
+    # 带上 run_id，避免两个用户同一秒问同样的问题时互相覆盖
+    filename = f"{ts}_{_task_slug(task)}_{run_id[:6]}.jsonl"
     out_path = trajectories_dir / filename
 
     records = []
@@ -47,6 +55,9 @@ def save(agent, task: str, trajectories_dir: Path = Path("trajectories")) -> Pat
         "run_id": run_id,
         "timestamp": ts,
         "task": task,
+        "user": user,
+        "session_id": session_id,
+        "source": source,
     })
 
     for step in agent.memory.steps:

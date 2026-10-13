@@ -12,6 +12,8 @@ import os
 import re
 import sys
 import argparse
+import threading
+import uuid
 import tempfile
 from pathlib import Path
 
@@ -19,8 +21,10 @@ PROJECT_ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
+from core import auth, config, errors
 from core.agent import build_agent
 from core import trajectory as traj_recorder
+from core.sessions import SessionError, UserLimiter
 from core.skill_installer import install_from_zip, install_from_skill_md, uninstall_skill
 from core.skill_loader import SkillRegistry
 from tools import ALL_TOOLS
@@ -28,32 +32,27 @@ from smolagents.memory import ActionStep, PlanningStep, FinalAnswerStep
 from smolagents.gradio_ui import pull_messages_from_step
 from smolagents.models import ChatMessageStreamDelta, agglomerate_stream_deltas
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv(PROJECT_ROOT / ".env")
-except ImportError:
-    pass
+SKILLS_DIR = PROJECT_ROOT / "skills"
 
-MODEL_ID     = os.getenv("MODEL_ID", "Pro/zai-org/GLM-5.1")
-API_BASE     = os.getenv("API_BASE", "https://api.siliconflow.cn/v1/")
-API_KEY      = os.getenv("API_KEY") or ""
-SKILLS_DIR   = PROJECT_ROOT / "skills"
-USE_DOCKER   = os.getenv("USE_DOCKER", "0").strip() in ("1", "true", "yes")
-DOCKER_IMAGE = os.getenv("DOCKER_IMAGE", "agent-sandbox:latest")
+# 每用户的频率、并发和会话数上限（与 api.py 用同一组配置，各自计数）
+_limiter = UserLimiter(config.RATE_LIMIT_PER_MINUTE, config.MAX_CONCURRENT_RUNS_PER_USER)
+_agent_counts: dict[str, int] = {}
+_agent_counts_lock = threading.Lock()
 
 
-def _build(upload_files, outputs_dir):
-    return build_agent(
-        model_id=MODEL_ID,
-        api_base=API_BASE,
-        api_key=API_KEY,
-        skills_dir=SKILLS_DIR,
-        extra_tools=ALL_TOOLS,
-        upload_files=upload_files or None,
-        outputs_persist_to=outputs_dir,
-        use_docker=USE_DOCKER,
-        docker_image=DOCKER_IMAGE,
-    )
+def _release_state(state):
+    """回收一个会话状态里的 agent（主动点"新对话"、空闲超时、关闭页面时都会走到这里）。"""
+    agent = state.pop("agent", None) if isinstance(state, dict) else None
+    if agent is None:
+        return
+    try:
+        agent.cleanup()
+    except Exception:
+        pass
+    owner = state.get("owner")
+    with _agent_counts_lock:
+        if owner in _agent_counts:
+            _agent_counts[owner] = max(0, _agent_counts[owner] - 1)
 
 
 def _list_skills_md() -> str:
@@ -124,21 +123,46 @@ def create_app():
 
     # ── Chat 事件 ──────────────────────────────────────────────────────────────
 
-    def _get_or_create_agent(session, model_id, api_base, api_key, file_paths):
+    def _current_user(request) -> auth.User:
+        user = auth.user_by_name(getattr(request, "username", None))
+        if user is None:
+            raise gr.Error("登录已失效，请刷新页面重新登录")
+        return user
+
+    def _session_label(session) -> str:
+        sid = session.get("id") if isinstance(session, dict) else None
+        return f"会话 ID：`{sid}`" if sid else "会话 ID：发送第一条消息后生成"
+
+    def _get_or_create_agent(session, user, model_id, file_paths):
         """首次创建 agent；之后复用，多轮对话靠 agent.memory 保持上下文。"""
         if session.get("agent") is None:
+            try:
+                model_id = config.resolve_model(model_id)
+            except ValueError as e:
+                raise gr.Error(str(e))
+            with _agent_counts_lock:
+                if _agent_counts.get(user.name, 0) >= config.MAX_SESSIONS_PER_USER:
+                    raise gr.Error(f"会话数已达上限（{config.MAX_SESSIONS_PER_USER}），请先在其他页面点\"新对话\"或关闭它们")
+                _agent_counts[user.name] = _agent_counts.get(user.name, 0) + 1
             outputs_dir = Path(tempfile.mkdtemp(prefix="agent_out_"))
-            agent = build_agent(
-                model_id=model_id.strip() or MODEL_ID,
-                api_base=api_base.strip() or API_BASE,
-                api_key=api_key.strip() or API_KEY,
-                skills_dir=SKILLS_DIR,
-                extra_tools=ALL_TOOLS,
-                upload_files=file_paths or None,
-                outputs_persist_to=outputs_dir,
-                use_docker=USE_DOCKER,
-                docker_image=DOCKER_IMAGE,
-            )
+            try:
+                agent = build_agent(
+                    model_id=model_id,
+                    api_base=config.API_BASE,
+                    api_key=config.API_KEY,
+                    skills_dir=SKILLS_DIR,
+                    extra_tools=ALL_TOOLS,
+                    upload_files=file_paths or None,
+                    outputs_persist_to=outputs_dir,
+                    use_docker=config.USE_DOCKER,
+                    docker_image=config.DOCKER_IMAGE,
+                )
+            except BaseException:
+                with _agent_counts_lock:
+                    _agent_counts[user.name] -= 1
+                raise
+            session["owner"] = user.name
+            session["id"] = uuid.uuid4().hex[:16]
             session["agent"] = agent
             session["outputs_dir"] = str(outputs_dir)
             session["is_new"] = True
@@ -158,13 +182,26 @@ def create_app():
             session["newly_uploaded"] = newly_added
         return agent
 
-    def on_submit(task, uploaded_files, history, session, model_id, api_base, api_key):
+    def on_submit(task, uploaded_files, history, session, model_id, request: gr.Request):
         if not task.strip():
-            yield history, session, gr.update()
+            yield history, session, gr.update(), _session_label(session)
             return
+        user = _current_user(request)
+        if len(task) > config.MAX_TASK_CHARS:
+            raise gr.Error(f"任务描述过长（上限 {config.MAX_TASK_CHARS} 字符）")
+        try:
+            _limiter.start_run(user)
+        except SessionError as e:
+            raise gr.Error(e.message)
+        try:
+            for hist, sess, files in _run_turn(task, uploaded_files, history, session, user, model_id):
+                yield hist, sess, files, _session_label(sess)
+        finally:
+            _limiter.end_run(user)
 
+    def _run_turn(task, uploaded_files, history, session, user, model_id):
         file_paths = [f.name for f in (uploaded_files or [])]
-        agent = _get_or_create_agent(session, model_id, api_base, api_key, file_paths)
+        agent = _get_or_create_agent(session, user, model_id, file_paths)
         reset_memory = session.pop("is_new", True)
         newly_uploaded = session.pop("newly_uploaded", [])
         if newly_uploaded:
@@ -201,8 +238,16 @@ def create_app():
                     ):
                         history.append({"role": msg.role, "content": msg.content, **({"metadata": msg.metadata} if msg.metadata else {})})
                 yield history, session, gr.update(visible=False)
+        except Exception as e:
+            # 把原因显示在对话里，而不是只在服务端终端打印一段堆栈
+            if streaming_idx is not None:
+                history.pop(streaming_idx)
+            history.append({"role": "assistant", "content": f"⚠️ {errors.describe(e, session.get('id'))}"})
+            yield history, session, gr.update(visible=False)
+            return
         finally:
-            traj_recorder.save(agent, task, PROJECT_ROOT / "trajectories")
+            traj_recorder.save(agent, task, PROJECT_ROOT / "trajectories",
+                               user=user.name, session_id=session.get("id"), source="web")
             # 不 cleanup，保留 agent 供下一轮使用
 
         outputs_dir = Path(session["outputs_dir"])
@@ -213,9 +258,8 @@ def create_app():
             yield history, session, gr.update(visible=False)
 
     def on_clear(session):
-        if session.get("agent"):
-            session["agent"].cleanup()
-        return [], {}, gr.update(visible=False)
+        _release_state(session)
+        return [], {}, gr.update(visible=False), _session_label({})
 
     def on_upload_hint(uploaded_files):
         if not uploaded_files:
@@ -225,8 +269,10 @@ def create_app():
 
     # ── Skills 事件 ────────────────────────────────────────────────────────────
 
-    def on_skill_upload(skill_file):
+    def on_skill_upload(skill_file, request: gr.Request):
         """安装上传的 ZIP 或 SKILL.md，返回 (状态消息, skill 列表, 卸载下拉框)。"""
+        if not _current_user(request).is_admin:
+            return "⛔ 只有管理员可以安装 skill", _list_skills_md(), gr.update()
         if skill_file is None:
             return "请先选择文件", _list_skills_md(), gr.update()
 
@@ -244,8 +290,10 @@ def create_app():
         names = _list_skill_names()
         return f"✅ {msg}", _list_skills_md(), gr.update(choices=names)
 
-    def on_skill_uninstall(skill_name):
+    def on_skill_uninstall(skill_name, request: gr.Request):
         """卸载选中的 skill，返回 (状态消息, skill 列表, 卸载下拉框)。"""
+        if not _current_user(request).is_admin:
+            return "⛔ 只有管理员可以卸载 skill", _list_skills_md(), gr.update()
         if not skill_name:
             return "请先选择要卸载的 skill", _list_skills_md(), gr.update()
         try:
@@ -259,10 +307,16 @@ def create_app():
         names = _list_skill_names()
         return _list_skills_md(), gr.update(choices=names)
 
+    def on_page_load(request: gr.Request):
+        """按登录用户的角色决定是否显示 skill 的安装 / 卸载区（真正的权限校验在上面的处理函数里）。"""
+        is_admin = _current_user(request).is_admin
+        return gr.update(visible=is_admin), gr.update(visible=not is_admin)
+
     # ── 界面布局 ───────────────────────────────────────────────────────────────
 
     with gr.Blocks(title="Agent Skills", fill_height=True) as demo:
-        session_state = gr.State({})
+        # 空闲超时或页面关闭后，Gradio 删除状态时回收 agent 和沙箱
+        session_state = gr.State({}, time_to_live=config.SESSION_IDLE_TTL, delete_callback=_release_state)
 
         with gr.Tabs():
 
@@ -288,6 +342,7 @@ def create_app():
                             file_count="multiple",
                         )
                         upload_hint = gr.Markdown("未上传文件")
+                        session_info = gr.Markdown(_session_label({}))
 
                         gr.Markdown("---")
                         output_files = gr.File(
@@ -298,22 +353,12 @@ def create_app():
                         )
 
                         gr.Markdown("---")
-                        with gr.Accordion("⚙️ 模型配置", open=False):
-                            model_id_input = gr.Textbox(
-                                label="Model ID",
-                                value=MODEL_ID,
-                                placeholder="例：gpt-4o-mini",
-                            )
-                            api_base_input = gr.Textbox(
-                                label="API Base URL",
-                                value=API_BASE,
-                                placeholder="例：https://api.openai.com/v1/",
-                            )
-                            api_key_input = gr.Textbox(
-                                label="API Key",
-                                value=API_KEY,
-                                type="password",
-                            )
+                        model_id_input = gr.Dropdown(
+                            label="模型（新对话生效）",
+                            choices=config.allowed_models(),
+                            value=config.MODEL_ID,
+                            visible=len(config.allowed_models()) > 1,
+                        )
 
                     with gr.Column(scale=3):
                         chatbot = gr.Chatbot(
@@ -328,20 +373,19 @@ def create_app():
 
                 submit_kwargs = dict(
                     fn=on_submit,
-                    inputs=[task_input, file_upload, chatbot, session_state,
-                            model_id_input, api_base_input, api_key_input],
-                    outputs=[chatbot, session_state, output_files],
+                    inputs=[task_input, file_upload, chatbot, session_state, model_id_input],
+                    outputs=[chatbot, session_state, output_files, session_info],
                 )
                 send_btn.click(**submit_kwargs)
                 task_input.submit(**submit_kwargs)
                 clear_btn.click(on_clear, inputs=[session_state],
-                                outputs=[chatbot, session_state, output_files])
+                                outputs=[chatbot, session_state, output_files, session_info])
 
             # ── Tab 2: Skills 管理 ─────────────────────────────────────────────
             with gr.Tab("🧩 Skills 管理"):
                 with gr.Row():
 
-                    with gr.Column(scale=1, min_width=320):
+                    with gr.Column(scale=1, min_width=320, visible=False) as admin_col:
                         gr.Markdown("### 安装新 Skill")
                         gr.Markdown(
                             "支持两种格式：\n"
@@ -374,6 +418,7 @@ def create_app():
                         uninstall_status = gr.Markdown("")
 
                     with gr.Column(scale=2):
+                        admin_notice = gr.Markdown("_安装和卸载 skill 需要管理员账号。_", visible=False)
                         gr.Markdown("### 已安装 Skills")
                         refresh_btn = gr.Button("🔄 刷新列表", size="sm")
                         skills_list = gr.Markdown(_list_skills_md())
@@ -393,6 +438,8 @@ def create_app():
                     outputs=[skills_list, uninstall_dropdown],
                 )
 
+        demo.load(on_page_load, outputs=[admin_col, admin_notice])
+
     return demo
 
 
@@ -407,11 +454,15 @@ def main():
     if args.skills_dir:
         SKILLS_DIR = args.skills_dir.resolve()
 
-    if USE_DOCKER:
+    auth.check_startup()
+    if config.USE_DOCKER:
         from core.executor import cleanup_orphans
         cleanup_orphans()  # 上次进程崩溃后遗留的沙箱容器
 
-    create_app().launch(server_port=args.port, share=args.share)
+    launch_kwargs = {}
+    if not auth.auth_disabled():
+        launch_kwargs.update(auth=auth.authenticate_login, auth_message="用户名填账号名，密码填 token")
+    create_app().launch(server_port=args.port, share=args.share, **launch_kwargs)
 
 
 if __name__ == "__main__":
