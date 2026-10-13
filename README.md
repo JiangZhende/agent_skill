@@ -12,7 +12,7 @@
  └──────┬───────┘   └──────┬───────┘   └──────┬───────┘
         │                  │ POST /run (SSE)  │
  ┌──────▼───────┐   ┌──────▼───────┐   ┌──────▼───────┐
- │ app.py       │   │ api.py       │   │ main.py      │   入口层
+ │ app.py       │   │ api.py       │   │ main.py      │   入口层（app/api 需登录）
  │ Gradio UI    │   │ FastAPI      │   │ 示例脚本      │
  │ 会话:gr.State │   │ 会话:进程字典 │   │ 无会话        │
  │ 对话+Skill管理│   │ 每请求一线程  │   │              │
@@ -73,6 +73,9 @@
 agent_skills_poc/
 ├── core/
 │   ├── agent.py            # ToolCallingAgent 封装，注入 skill 机制
+│   ├── auth.py             # 用户表与 token 鉴权（python -m core.auth 管理用户）
+│   ├── config.py           # 服务端配置（模型地址和密钥、各项上限）
+│   ├── sessions.py         # 会话归属、空闲回收、每用户上限
 │   ├── executor.py         # 脚本执行器：DockerExecutor（沙箱）/ LocalExecutor（开发）
 │   ├── skill_loader.py     # SKILL.md 解析与 SkillRegistry
 │   ├── skill_installer.py  # 从 ZIP / SKILL.md 安装 / 卸载 skill
@@ -116,22 +119,75 @@ agent_skills_poc/
 - **Trajectory**：每次 run 自动写 `trajectories/<timestamp>.jsonl`，含 system_prompt，可直接用于 SFT/DPO 训练
 - **多用户并发**：对话、workspace、Docker 容器各自完全隔离；skill 库全局共享，安装/卸载操作串行化保证线程安全；Docker 镜像构建有全局锁，多用户同时触发只 build 一次
 
-## 快速开始
+## 启动
+
+### 首次准备
 
 ```bash
+# 1. 安装依赖（建议用独立环境，如 conda activate agent）
 pip install -r requirements.txt
 
-# 配置 API Key
+# 2. 配置模型
 cp .env.example .env
-# 编辑 .env，填入真实 API Key
+# 编辑 .env，填入 MODEL_ID、API_BASE、API_KEY
 
-# 启动 Web UI
-python app.py
+# 3. 创建第一个用户（管理员）。输出的 token 只显示一次，自己保存好
+python -m core.auth add <用户名> --admin
+```
 
-# 可选参数
-python app.py --port 7861 --share
+没有创建任何用户时，两个入口都会拒绝启动并提示上面这条命令。
+
+### 启动 Web UI
+
+```bash
+python app.py                 # 默认端口 7860
+python app.py --port 7861     # 换端口
 python app.py --skills-dir test_skills   # 指定其他 skill 目录（测试用）
 ```
+
+打开 <http://localhost:7860>，登录时**用户名填账号名，密码填 token**。
+
+`--share` 会生成公网链接，登录页会暴露在公网上，只在确实需要时使用。
+
+### 启动 API
+
+```bash
+uvicorn api:app --port 8000
+```
+
+请求头带 `Authorization: Bearer <token>`，用法见下方 [API](#api) 一节。Web UI 和 API 是两个独立的进程，可以同时运行，共用同一份用户表。
+
+### 启用 Docker 沙箱
+
+默认（`USE_DOCKER=0`）skill 脚本在本机以子进程执行，只适合开发。要在容器里执行：
+
+```bash
+# 1. 确认 Docker 在运行（macOS 上用 colima 时先 colima start）
+docker info
+
+# 2. 在 .env 里设置
+USE_DOCKER=1
+
+# 3. 照常启动。沙箱镜像不存在时会在首次执行脚本时自动构建
+python app.py
+```
+
+详见 [Docker 沙箱](#docker-沙箱) 一节。
+
+### 停止
+
+前台运行时按 `Ctrl+C`。服务退出时会回收所有会话的 workspace 和沙箱容器；如果进程被强杀，遗留的容器会在下次启动时清理。
+
+### 启动失败时
+
+| 现象 | 原因与处理 |
+|---|---|
+| `还没有任何用户` | 先执行 `python -m core.auth add <用户名> --admin` |
+| `No module named 'smolagents'` | 当前 Python 环境没装依赖，切到装了依赖的环境 |
+| 端口被占用 | 换 `--port`，或先停掉占用该端口的进程 |
+| 登录失败 | 密码要填 token 而不是自己设的密码；token 丢了就重新执行 `add` 换发 |
+| `生产环境必须启用沙箱` | 生产配置下不允许本机执行，启用沙箱或改回 `development` |
+| `failed to connect to the docker API` | Docker 没在运行，先启动它 |
 
 **配置文件 `.env`**（复制 `.env.example` 修改，不提交到 git）：
 
@@ -146,6 +202,63 @@ DOCKER_IMAGE=agent-sandbox:latest
 SANDBOX_RUNTIME=runc
 AGENT_ENV=development
 ```
+
+## 鉴权与用户
+
+两个入口都需要登录，没有配置任何用户时拒绝启动。
+
+```bash
+python -m core.auth add alice --admin   # 管理员：可以安装和卸载 skill
+python -m core.auth add bob             # 普通用户
+python -m core.auth add bob             # 再执行一次是换发 token，旧 token 立即失效
+python -m core.auth list
+python -m core.auth remove bob
+```
+
+用户表存在 `users.json`（已 gitignore，权限 600），只保存 token 的 SHA-256，明文 token 只在创建时显示一次。增删用户不需要重启服务。
+
+- **API**：请求头带 `Authorization: Bearer <token>`
+- **Web UI**：登录页用户名填账号名，密码填 token
+- **本机开发**：设 `AUTH_DISABLED=1` 可跳过鉴权，所有请求算作管理员；`AGENT_ENV=production` 时不允许
+
+**模型配置只在服务端**：`API_BASE` 和 `API_KEY` 只从 `.env` 读取，任何入口都不接受调用方传入。调用方只能在 `MODEL_ID` 和 `ALLOWED_MODELS` 列出的模型名里选。
+
+**每用户的上限**（`.env` 可调）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `SESSION_IDLE_TTL` | 1800 | 会话空闲多少秒后回收（连同 workspace 和沙箱容器） |
+| `MAX_SESSIONS_PER_USER` | 5 | 同时存在的会话数 |
+| `MAX_CONCURRENT_RUNS_PER_USER` | 2 | 同时运行的任务数 |
+| `RATE_LIMIT_PER_MINUTE` | 30 | 每分钟请求数 |
+
+两个入口各自计数。
+
+## API
+
+```bash
+TOKEN=<创建用户时得到的 token>
+
+# 新建会话并执行；响应头 X-Session-Id 是会话 id
+curl -N -D - -X POST http://localhost:8000/run \
+     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d '{"task": "用一句话介绍你自己"}'
+
+# 在同一会话里继续
+curl -N -X POST http://localhost:8000/run \
+     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d '{"task": "再详细一点", "session_id": "<X-Session-Id>"}'
+```
+
+| 接口 | 说明 |
+|---|---|
+| `POST /run` | 执行任务，返回 SSE 流。请求体只有 `task`、`session_id`（可选）、`model_id`（可选，仅新建会话时生效），其他字段会被拒绝 |
+| `GET /sessions` | 列出自己的会话 |
+| `DELETE /sessions/{id}` | 删除自己的会话 |
+| `GET /models` | 可选的模型 |
+| `GET /health` | 健康检查，不需要 token |
+
+会话 id 由服务端生成并绑定用户；别人的会话和不存在的会话都返回 404。同一会话同时只能有一个任务在运行（409）。超过上限返回 429。
 
 ## Docker 沙箱
 
@@ -201,8 +314,8 @@ docker build -t agent-sandbox:latest .
 
 `python app.py` 启动后提供两个 Tab：
 
-- **💬 对话**：多轮对话，支持文件上传、步骤级流式输出、产物文件下载、模型配置
-- **🧩 Skills 管理**：查看已安装 skill，上传 ZIP 或 SKILL.md 安装新 skill，卸载已有 skill
+- **💬 对话**：多轮对话，支持文件上传、步骤级流式输出、产物文件下载
+- **🧩 Skills 管理**：查看已安装 skill；管理员可以上传 ZIP 或 SKILL.md 安装新 skill、卸载已有 skill
 
 ### 对话 Tab 功能
 
@@ -212,7 +325,7 @@ docker build -t agent-sandbox:latest .
 | 文件上传 | 上传后通过 `@input:<filename>` 供 skill 脚本引用；同一 session 内新上传文件会提示模型当前轮新文件名 |
 | 流式输出 | 工具调用步骤完成后即时推送；`final_answer` 回答内容 token 级逐字流式显示 |
 | 产物下载 | skill 生成的文件（Excel、报告等）可直接点击下载 |
-| 模型配置 | 展开"⚙️ 模型配置"可修改 Model ID / API Base URL / API Key（点"新对话"生效） |
+| 模型选择 | 配置了 `ALLOWED_MODELS` 时出现模型下拉框（点"新对话"生效）；模型地址和密钥只在服务端配置 |
 
 ### 安装 / 卸载 Skill
 
@@ -232,7 +345,7 @@ my_skill.zip
 
 安装/卸载后无需重启，下次发送任务即生效。
 
-> **注意**：skill 库全局共享，任何用户的操作对所有用户可见。已在运行中的 session 不受影响，变更在下一次对话时生效。
+> **注意**：安装和卸载只有管理员能操作。skill 库全局共享，管理员的操作对所有用户可见。已在运行中的 session 不受影响，变更在下一次对话时生效。
 
 ## 测试
 
@@ -240,7 +353,10 @@ my_skill.zip
 
 ```bash
 # 全量测试
-python -m pytest test_sandbox.py -v
+python -m pytest test_sandbox.py test_auth.py -v
+
+# 鉴权、会话归属、限流（不需要网络和 Docker）
+python -m pytest test_auth.py -v
 
 # 只跑 read_resource 相关
 python -m pytest test_sandbox.py::TestReadResource test_sandbox.py::TestRegionLookupScript -v
@@ -251,17 +367,28 @@ python -m pytest test_sandbox.py::TestDockerReal -v
 
 ## Trajectory 格式
 
-每次运行在 `trajectories/` 下生成一个 JSONL 文件：
+Web UI 和 API 的每次运行都会在 `trajectories/` 下生成一个 JSONL 文件，文件名是 `<日期>_<时间>_<任务前 30 字>_<run_id 前 6 位>.jsonl`：
 
 ```jsonl
 {"type": "system_prompt", "run_id": "...", "content": "..."}
-{"type": "task",          "run_id": "...", "timestamp": "...", "task": "..."}
+{"type": "task",          "run_id": "...", "timestamp": "...", "task": "...", "user": "alice", "session_id": "...", "source": "web"}
 {"type": "tool_call",     "run_id": "...", "step": 1, "tool": "load_skill",           "args": {...}, "duration": 1.2}
 {"type": "observation",   "run_id": "...", "step": 1, "content": "..."}
 {"type": "tool_call",     "run_id": "...", "step": 2, "tool": "execute_skill_script", "args": {...}, "duration": 3.4}  // duration 可为 null（步骤异常退出时）
 {"type": "observation",   "run_id": "...", "step": 2, "content": "..."}
 {"type": "final_answer",  "run_id": "...", "step": 3, "content": "..."}
 ```
+
+`task` 记录里的 `user` 是发起对话的用户名，`session_id` 标识会话（同一会话的多轮对话相同），`source` 是入口（`web` 或 `api`）。
+
+```bash
+ls -t trajectories | head                           # 最近的几条
+grep -l '"user": "alice"' trajectories/*.jsonl      # 某个用户的全部对话
+grep -l '"session_id": "<id>"' trajectories/*.jsonl # 某个会话的各轮
+grep -l "关键词" trajectories/*.jsonl                # 按内容找
+```
+
+注意：多轮对话时每轮存一个文件，内容是该会话到那一刻为止的全部步骤，所以同一会话里后一个文件包含前面几轮。文件是明文，含用户上传内容的脚本输出，目录权限要自行控制。
 
 ## SKILL.md 写法
 
@@ -308,3 +435,7 @@ read_resource(skill_name="my_skill", path="resources/config.json")
 - 脚本的工作目录是 skill 目录，skill 自带的资源文件用相对路径引用（如 `resources/regions.json`）；参数里不能传绝对路径或 `..`
 - 需要联网时在 SKILL.md frontmatter 里声明 `network: true`，否则沙箱内没有网络
 - 额外的 Python 依赖要预先装进沙箱镜像，运行时不会安装
+
+## 路线图
+
+从原型到多用户平台的后续工作、已知安全问题及其修复状态，见 [docs/ROADMAP.md](docs/ROADMAP.md)。

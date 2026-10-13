@@ -22,6 +22,10 @@ trajectories/
 .env
 .env.local
 
+# 用户表（含 token 的哈希，禁止提交）
+users.json
+users.json.tmp
+
 # 测试文件
 test_skills/
 test_*.py

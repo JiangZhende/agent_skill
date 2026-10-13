@@ -17,6 +17,7 @@
 """
 import os
 import re
+import time
 import uuid
 from pathlib import Path, PurePosixPath
 from typing import List
@@ -95,6 +96,38 @@ def make_run_script_tool(registry, skills_dir, workspace=None, executor=None):
             return executor.path_for(host_path), None
 
         return value, None
+
+    def _hide_paths(text):
+        """把输出里的真实路径换回 @ 引用。
+
+        脚本常把收到的路径原样打印出来；模型不需要、也不应该看到真实路径，
+        换成引用后还能直接用在下一步的 args 里。
+        """
+        if not text:
+            return text
+        if workspace is not None:
+            for d, prefix in (
+                (workspace.inputs_dir, "@input:"),
+                (workspace.workspace_dir, "@workspace:"),
+                (workspace.outputs_dir, "@output:"),
+            ):
+                for variant in _path_variants(d):
+                    text = text.replace(variant + "/", prefix)
+        for variant in _path_variants(executor.results_dir):
+            text = re.sub(re.escape(variant) + r"/(r_[a-z0-9]+)\.json", r"@\1", text)
+        return text
+
+    def _path_variants(host_dir):
+        """同一个目录在脚本里可能出现的写法：执行器看到的路径，以及解析符号链接后的路径。"""
+        variants = []
+        for p in (Path(host_dir), Path(host_dir).resolve()):
+            try:
+                v = executor.path_for(p).rstrip("/")
+            except ValueError:
+                continue
+            if v not in variants:
+                variants.append(v)
+        return variants
 
     def _cache_stdout(stdout):
         rid = f"r_{uuid.uuid4().hex[:8]}"
@@ -177,10 +210,12 @@ def make_run_script_tool(registry, skills_dir, workspace=None, executor=None):
             timeout = 60
         stdin_bytes = input.encode("utf-8") if input else None
         script_rel = resolved_path.relative_to((skills_root / skill_name).resolve()).as_posix()
+        started = time.monotonic()
         try:
             result = executor.run(registry.skills[skill_name], script_rel, argv, stdin_bytes, timeout)
         except Exception as e:
             return f"[执行错误] {type(e).__name__}: {e}"
+        elapsed = time.monotonic() - started
 
         if result.timed_out:
             return f"[超时] 脚本执行超过 {timeout} 秒，已终止"
@@ -211,6 +246,8 @@ def make_run_script_tool(registry, skills_dir, workspace=None, executor=None):
         if args:
             parts.append(f"**Arguments**: {[str(a) for a in args]}")
         parts.append(f"**Exit Code**: {result.exit_code}")
+        # 脚本自身的耗时（步骤总耗时减去它，就是模型花的时间）
+        parts.append(f"**Duration**: {elapsed:.1f}s")
         if rid:
             parts.append(
                 f"**Result ID**: {rid}"
@@ -219,7 +256,7 @@ def make_run_script_tool(registry, skills_dir, workspace=None, executor=None):
             )
 
         if stdout_text:
-            display = stdout_text.rstrip()
+            display = _hide_paths(stdout_text).rstrip()
             if len(display) > 10000:
                 display = display[:10000] + f"\n...（已截断，完整 {len(stdout_text)} 字符）"
             parts.append("\n## Standard Output\n```")
@@ -227,7 +264,7 @@ def make_run_script_tool(registry, skills_dir, workspace=None, executor=None):
             parts.append("```")
 
         if stderr_text:
-            display = stderr_text.rstrip()
+            display = _hide_paths(stderr_text).rstrip()
             if len(display) > 2000:
                 display = display[:2000] + "...（已截断）"
             parts.append("\n## Standard Error\n```")
