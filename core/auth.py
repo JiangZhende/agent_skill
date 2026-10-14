@@ -1,9 +1,7 @@
 """
 用户与鉴权。
 
-用户表是一个 JSON 文件（默认项目根目录的 users.json，不进 git），只保存 token 的 SHA-256：
-
-    {"users": [{"name": "alice", "role": "admin", "token_sha256": "..."}]}
+用户存在数据库的 users 表里（见 core/db.py），只保存 token 的 SHA-256。
 
 管理用户（token 只在创建时显示一次）:
 
@@ -23,11 +21,12 @@ import os
 import re
 import secrets
 import sys
-import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-from core import config
+from sqlalchemy import select
+
+from core import config, db
 
 ROLES = ("user", "admin")
 _NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
@@ -52,57 +51,26 @@ def _hash(token: str) -> str:
 
 
 class UserStore:
-    """从 JSON 文件读用户表；文件变化后自动重新加载，增删用户不用重启服务。"""
-
-    def __init__(self, path: Path):
-        self.path = Path(path)
-        self._lock = threading.Lock()
-        self._mtime = None
-        self._by_hash: dict[str, User] = {}
-
-    def _load(self) -> dict[str, User]:
-        try:
-            mtime = self.path.stat().st_mtime_ns
-        except OSError:
-            self._mtime, self._by_hash = None, {}
-            return self._by_hash
-        if mtime != self._mtime:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            by_hash = {}
-            for u in data.get("users", []):
-                role = u.get("role", "user")
-                if role not in ROLES or not _NAME_RE.match(u.get("name", "")):
-                    raise ValueError(f"用户表里有非法条目: {u.get('name')!r}")
-                by_hash[u["token_sha256"]] = User(name=u["name"], role=role)
-            self._mtime, self._by_hash = mtime, by_hash
-        return self._by_hash
+    """数据库里的用户表。增删用户立即对所有服务进程生效。"""
 
     def verify(self, token: str | None) -> User | None:
         if not token:
             return None
-        with self._lock:
-            return self._load().get(_hash(token))
+        with db.session_scope() as s:
+            row = s.scalar(select(db.User).where(db.User.token_sha256 == _hash(token)))
+            return User(name=row.name, role=row.role) if row else None
 
     def users(self) -> list[User]:
-        with self._lock:
-            return sorted(self._load().values(), key=lambda u: u.name)
+        with db.session_scope() as s:
+            return [User(name=r.name, role=r.role) for r in s.scalars(select(db.User).order_by(db.User.name))]
 
-    # ── 管理 ──────────────────────────────────────────────────────────────
-
-    def _read_raw(self) -> list[dict]:
-        if not self.path.exists():
-            return []
-        return json.loads(self.path.read_text(encoding="utf-8")).get("users", [])
-
-    def _write_raw(self, users: list[dict]):
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump({"users": users}, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.path)
+    def get(self, name: str) -> User | None:
+        with db.session_scope() as s:
+            row = s.get(db.User, name) if name else None
+            return User(name=row.name, role=row.role) if row else None
 
     def add(self, name: str, role: str = "user", token: str = None) -> str:
-        """新增用户（已存在则换发 token），返回明文 token。明文不落盘。
+        """新增用户（已存在则换发 token），返回明文 token。明文不落库。
 
         token 不传则随机生成；自己指定的 token 强度由调用方负责。
         """
@@ -111,41 +79,63 @@ class UserStore:
         if role not in ROLES:
             raise ValueError(f"role 必须是 {ROLES} 之一")
         token = token or secrets.token_urlsafe(32)
-        with self._lock:
-            users = self._read_raw()
-            if any(u.get("token_sha256") == _hash(token) and u.get("name") != name for u in users):
+        with db.session_scope() as s:
+            clash = s.scalar(select(db.User).where(db.User.token_sha256 == _hash(token), db.User.name != name))
+            if clash is not None:
                 raise ValueError("这个 token 已被其他用户使用")
-            users = [u for u in users if u.get("name") != name]
-            users.append({"name": name, "role": role, "token_sha256": _hash(token)})
-            self._write_raw(users)
+            row = s.get(db.User, name)
+            if row is None:
+                s.add(db.User(name=name, role=role, token_sha256=_hash(token)))
+            else:
+                row.role, row.token_sha256 = role, _hash(token)
         return token
 
     def remove(self, name: str) -> bool:
-        with self._lock:
-            users = self._read_raw()
-            kept = [u for u in users if u.get("name") != name]
-            if len(kept) == len(users):
+        with db.session_scope() as s:
+            row = s.get(db.User, name)
+            if row is None:
                 return False
-            self._write_raw(kept)
+            s.delete(row)
             return True
 
+    def import_json(self, path: Path) -> int:
+        """把旧版 users.json 里的用户导入数据库（已存在的用户名跳过），返回导入个数。"""
+        try:
+            entries = json.loads(Path(path).read_text(encoding="utf-8")).get("users", [])
+        except (OSError, ValueError):
+            return 0
+        imported = 0
+        with db.session_scope() as s:
+            for u in entries:
+                name, role, digest = u.get("name", ""), u.get("role", "user"), u.get("token_sha256", "")
+                if not _NAME_RE.match(name) or role not in ROLES or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                    continue
+                if s.get(db.User, name) is None:
+                    s.add(db.User(name=name, role=role, token_sha256=digest))
+                    imported += 1
+        return imported
 
-def _default_path() -> Path:
-    return Path(os.getenv("AUTH_USERS_FILE", str(config.PROJECT_ROOT / "users.json")))
 
-
-_store = UserStore(_default_path())
+_store = UserStore()
 
 
 def get_store() -> UserStore:
     return _store
 
 
-def configure(path: Path) -> UserStore:
-    """改用另一份用户表（测试用）。"""
-    global _store
-    _store = UserStore(path)
-    return _store
+def legacy_users_file() -> Path:
+    return Path(os.getenv("AUTH_USERS_FILE", str(config.PROJECT_ROOT / "users.json")))
+
+
+def migrate_legacy_users() -> int:
+    """数据库里还没有用户、而旧版 users.json 存在时，把它导入。服务启动时调用。"""
+    path = legacy_users_file()
+    if not path.exists() or get_store().users():
+        return 0
+    imported = get_store().import_json(path)
+    if imported:
+        print(f"[auth] 已从 {path} 导入 {imported} 个用户到数据库；该文件不再使用，可以删除", file=sys.stderr)
+    return imported
 
 
 def auth_disabled() -> bool:
@@ -160,9 +150,10 @@ def check_startup():
             raise RuntimeError("AGENT_ENV=production 时不允许 AUTH_DISABLED=1")
         print("[auth] 警告：鉴权已关闭（AUTH_DISABLED=1），所有请求都以管理员身份执行，仅限本机开发", file=sys.stderr)
         return
+    migrate_legacy_users()
     if not get_store().users():
         raise RuntimeError(
-            f"还没有任何用户（{get_store().path}）。先创建一个管理员:\n"
+            f"还没有任何用户。先创建一个管理员:\n"
             f"    python -m core.auth add <用户名> --admin\n"
             f"只在本机开发时，可以设 AUTH_DISABLED=1 跳过鉴权。"
         )
@@ -185,7 +176,7 @@ def user_by_name(name: str | None) -> User | None:
     """按用户名取用户（登录态里只有用户名时用）。"""
     if auth_disabled():
         return DEV_USER
-    return next((u for u in get_store().users() if u.name == name), None)
+    return get_store().get(name)
 
 
 def main(argv=None):
@@ -200,13 +191,15 @@ def main(argv=None):
     p_rm.add_argument("name")
     args = parser.parse_args(argv)
 
+    migrate_legacy_users()
     store = get_store()
+    where = db.get_engine().url.render_as_string(hide_password=True)
     if args.cmd == "add":
         try:
             token = store.add(args.name, "admin" if args.admin else "user", token=args.token)
         except ValueError as e:
             parser.error(str(e))
-        print(f"用户 {args.name}（{'admin' if args.admin else 'user'}）已写入 {store.path}")
+        print(f"用户 {args.name}（{'admin' if args.admin else 'user'}）已写入 {where}")
         if args.token:
             if len(args.token) < 16:
                 print("警告：这个 token 太短，容易被猜中；服务没有登录失败次数限制，不要用于能被别人访问的部署", file=sys.stderr)

@@ -9,11 +9,14 @@ FastAPI 入口：agent run 的 SSE 流式接口。
 所有接口（除 /health）都需要 `Authorization: Bearer <token>`。
 
 接口:
-    POST   /run                    执行 agent，返回 SSE 流；响应头 X-Session-Id 是会话 id
-    GET    /sessions               列出自己的会话
-    DELETE /sessions/{session_id}  删除自己的会话
-    GET    /models                 可选的模型
-    GET    /health                 健康检查
+    POST   /run                                   执行 agent，返回 SSE 流；响应头 X-Session-Id 是会话 id
+    GET    /sessions                              列出自己的会话（服务重启后仍在）
+    GET    /sessions/{id}                         会话详情和历次运行；?events=1 带上每次运行的过程
+    GET    /sessions/{id}/files                   会话的上传文件和产物
+    GET    /sessions/{id}/files/{area}/{name}     下载一个文件（area 为 inputs 或 outputs）
+    DELETE /sessions/{id}                         删除自己的会话（连同文件和记录）
+    GET    /models                                可选的模型
+    GET    /health                                健康检查
 
 SSE 事件格式（每行 data: <json>\\n\\n）:
     {"type": "token",  "content": "..."}          # final_answer 逐字 token
@@ -25,56 +28,28 @@ import asyncio
 import json
 import logging
 import sys
-import tempfile
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.background import BackgroundTask
 
 PROJECT_ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from core import auth, config, errors
-from core import trajectory as traj_recorder
-from core.agent import build_agent
-from core.sessions import Session, SessionError, SessionManager, UserLimiter
-from tools import ALL_TOOLS
+from core import auth, config, db, errors
+from core.sessions import RunHandle, SessionError, SessionService
 from smolagents.memory import ActionStep, PlanningStep, FinalAnswerStep
 from smolagents.gradio_ui import pull_messages_from_step
 from smolagents.models import ChatMessageStreamDelta, agglomerate_stream_deltas
 
 logger = logging.getLogger("agent.api")
 
-SKILLS_DIR = PROJECT_ROOT / "skills"
-TRAJECTORIES_DIR = PROJECT_ROOT / "trajectories"
-
-
-def _make_agent(model_id: str):
-    """模型的地址和密钥只来自服务端配置，调用方只能在白名单里选模型名。"""
-    outputs_dir = Path(tempfile.mkdtemp(prefix="agent_out_"))
-    agent = build_agent(
-        model_id=model_id,
-        api_base=config.API_BASE,
-        api_key=config.API_KEY,
-        skills_dir=SKILLS_DIR,
-        extra_tools=ALL_TOOLS,
-        outputs_persist_to=outputs_dir,
-        use_docker=config.USE_DOCKER,
-        docker_image=config.DOCKER_IMAGE,
-    )
-    return agent, outputs_dir
-
-
-# 会话在进程内存里，重启后清空
-manager = SessionManager(
-    agent_factory=_make_agent,
-    limiter=UserLimiter(config.RATE_LIMIT_PER_MINUTE, config.MAX_CONCURRENT_RUNS_PER_USER),
-    idle_ttl=config.SESSION_IDLE_TTL,
-    max_per_user=config.MAX_SESSIONS_PER_USER,
-)
+# 会话、对话记忆和文件都在数据库和文件存储里；这个对象只持有可以随时重建的运行时缓存
+service = SessionService()
 
 
 # ── SSE 辅助 ────────────────────────────────────────────────────────────────
@@ -125,17 +100,19 @@ def _extract_answer_from_deltas(accumulated: list[ChatMessageStreamDelta]) -> st
 
 # ── 同步 → 异步桥接 ─────────────────────────────────────────────────────────
 
-def _run_agent_thread(agent, task: str, reset: bool, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop,
-                      on_finish=None, session_id: str = None):
-    """在子线程中运行 agent，通过 queue 把事件推送到异步生成器。"""
-    final_answer = None
+def _run_agent_thread(handle: RunHandle, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
+    """在子线程中运行 agent，通过 queue 把事件推送到异步生成器；结束时把结果交回会话服务。"""
+    agent = handle.agent
+    final_answer = error_text = None
+    events: list[dict] = []
     accumulated_deltas: list[ChatMessageStreamDelta] = []
 
     def emit(payload: dict):
         asyncio.run_coroutine_threadsafe(queue.put(payload), loop).result()
 
     try:
-        for event in agent.run(task, stream=True, reset=reset):
+        # 记忆已经从数据库恢复，所以总是接着之前的对话继续（新会话时记忆本来就是空的）
+        for event in agent.run(handle.task, stream=True, reset=False):
             if isinstance(event, ChatMessageStreamDelta):
                 accumulated_deltas.append(event)
                 content = _extract_answer_from_deltas(accumulated_deltas)
@@ -150,6 +127,7 @@ def _run_agent_thread(agent, task: str, reset: bool, queue: asyncio.Queue, loop:
                     payload = {"type": "step", "role": msg.role, "content": msg.content or ""}
                     if msg.metadata:
                         payload["metadata"] = msg.metadata
+                    events.append({k: v for k, v in payload.items() if k != "type"})
                     emit(payload)
 
                 if isinstance(event, FinalAnswerStep):
@@ -157,48 +135,32 @@ def _run_agent_thread(agent, task: str, reset: bool, queue: asyncio.Queue, loop:
 
     except Exception as e:
         # 异常详情可能带模型服务地址等内部信息，只记日志，给调用方原因类别和错误编号
+        error_text = errors.describe(e, handle.session_id)
         try:
-            emit({"type": "error", "content": errors.describe(e, session_id)})
+            emit({"type": "error", "content": error_text})
         except Exception:
             pass
     finally:
-        if on_finish:
-            on_finish()  # 先释放会话，即使下面的推送因为事件循环已关闭而失败
+        # 先落库并释放会话，再通知客户端结束：客户端收到 done 后马上发下一条也不会撞上"正在运行"
+        try:
+            service.finish_run(handle, answer=final_answer, error=error_text, events=events)
+        except Exception:
+            logger.exception("finish_run failed (session=%s)", handle.session_id)
         try:
             emit({"type": "done", "answer": final_answer or ""})
         except Exception:
             pass
 
 
-def _start_run(session: Session, task: str) -> tuple[asyncio.Queue, threading.Thread]:
+def _start_run(handle: RunHandle) -> tuple[asyncio.Queue, threading.Thread]:
     """启动 agent 线程。在返回响应之前就启动，保证会话一定会被释放（即使客户端马上断开）。"""
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
-
-    reset = session.is_new
-    session.is_new = False
-
-    def on_finish():
-        # 先存轨迹再释放会话：释放后下一轮可能马上开始改 agent.memory
-        try:
-            traj_recorder.save(session.agent, task, TRAJECTORIES_DIR,
-                               user=session.owner, session_id=session.id, source="api")
-        except Exception:
-            logger.exception("save trajectory failed")
-        finally:
-            manager.release(session)
-
-    thread = threading.Thread(
-        target=_run_agent_thread,
-        args=(session.agent, task, reset, queue, loop),
-        # 会话在 agent 线程真正结束时才释放：客户端提前断开时线程还在跑
-        kwargs={"on_finish": on_finish, "session_id": session.id},
-        daemon=True,
-    )
+    thread = threading.Thread(target=_run_agent_thread, args=(handle, queue, loop), daemon=True)
     try:
         thread.start()
     except BaseException:
-        manager.release(session)
+        service.finish_run(handle, error="运行未能启动")
         raise
     return queue, thread
 
@@ -220,21 +182,23 @@ async def _sweep_loop():
     while True:
         await asyncio.sleep(60)
         try:
-            await asyncio.to_thread(manager.sweep)
+            await asyncio.to_thread(service.sweep)
         except Exception:
             logger.exception("session sweep failed")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    db.get_engine()           # 连接数据库并升级表结构
     auth.check_startup()
     if config.USE_DOCKER:
         from core.executor import cleanup_orphans
-        cleanup_orphans()  # 上次进程崩溃后遗留的沙箱容器
+        cleanup_orphans()     # 上次进程崩溃后遗留的沙箱容器
+    service.startup()
     sweeper = asyncio.create_task(_sweep_loop())
     yield
     sweeper.cancel()
-    manager.close_all()
+    service.close()
 
 
 app = FastAPI(title="Agent Skills API", lifespan=lifespan)
@@ -275,36 +239,45 @@ async def run(req: RunRequest, user: auth.User = Depends(current_user)):
              -d '{"task": "北京负责人是谁"}' \\
              --no-buffer -D -
     """
-    try:
-        model_id = config.resolve_model(req.model_id)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    session = await asyncio.to_thread(manager.acquire, user, req.session_id, model_id)
-    if req.model_id and session.model_id != model_id:
-        manager.release(session)
-        raise HTTPException(status_code=400, detail=f"该会话使用的模型是 {session.model_id}，不能中途更换")
-
-    queue, thread = _start_run(session, req.task)
+    handle = await asyncio.to_thread(
+        service.start_run, user, req.session_id, req.model_id, req.task, "api")
+    queue, thread = _start_run(handle)
     return StreamingResponse(
         _event_stream(queue, thread),
         media_type="text/event-stream",
-        headers={"X-Session-Id": session.id},
+        headers={"X-Session-Id": handle.session_id, "X-Run-Id": handle.run_id},
     )
 
 
 @app.get("/sessions")
 async def list_sessions(user: auth.User = Depends(current_user)):
-    return {"sessions": [
-        {"session_id": s.id, "model_id": s.model_id, "busy": s.busy, "created_at": int(s.created_at)}
-        for s in manager.list(user)
-    ]}
+    return {"sessions": await asyncio.to_thread(service.list_sessions, user)}
+
+
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str, events: bool = False, user: auth.User = Depends(current_user)):
+    """会话详情和历次运行（任务、回答、状态）。events=1 时带上每次运行的过程。"""
+    return await asyncio.to_thread(service.get_session, user, session_id, events)
+
+
+@app.get("/sessions/{session_id}/files")
+async def list_files(session_id: str, user: auth.User = Depends(current_user)):
+    return {"files": await asyncio.to_thread(service.list_files, user, session_id)}
+
+
+@app.get("/sessions/{session_id}/files/{area}/{name:path}")
+async def download_file(session_id: str, area: str, name: str, user: auth.User = Depends(current_user)):
+    """下载会话的一个上传文件（area=inputs）或产物（area=outputs）。"""
+    import shutil
+    path = await asyncio.to_thread(service.fetch_file, user, session_id, area, name)
+    return FileResponse(path, filename=path.name,
+                        background=BackgroundTask(shutil.rmtree, path.parent, ignore_errors=True))
 
 
 @app.delete("/sessions/{session_id}")
 async def delete_session(session_id: str, user: auth.User = Depends(current_user)):
-    """清除自己的某个会话（释放 workspace 和 agent 资源）。"""
-    await asyncio.to_thread(manager.delete, user, session_id)
+    """删除自己的某个会话，连同它的文件、对话记忆和运行记录。"""
+    await asyncio.to_thread(service.delete_session, user, session_id)
     return {"deleted": session_id}
 
 

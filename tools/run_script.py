@@ -60,7 +60,11 @@ def make_run_script_tool(registry, skills_dir, workspace=None, executor=None):
     skills_root = Path(skills_dir).resolve()
     if executor is None:
         executor = LocalExecutor(workspace=workspace)
-    shared_cache = {}
+
+    call_counts: dict = {}   # 本工具实例（即本次运行）里各脚本的调用次数
+
+    def script_rel_for_limit(resolved_path, skill_name):
+        return resolved_path.relative_to((skills_root / skill_name).resolve()).as_posix()
 
     def _resolve_script(skill_name, script_path):
         """安全解析脚本路径，必须在 skills/<skill_name>/ 子目录下"""
@@ -85,9 +89,12 @@ def make_run_script_tool(registry, skills_dir, workspace=None, executor=None):
         m = re.match(r"^@(r_[a-z0-9]+)$", value)
         if m:
             rid = m.group(1)
-            if rid not in shared_cache:
+            # 以结果文件是否存在为准，而不是进程里的一张表：agent 每次运行都是新建的，
+            # 之前轮次（或同一会话里别的 agent）产生的结果照样能引用
+            path = executor.results_dir / f"{rid}.json"
+            if not path.is_file():
                 return None, f"result_id 不存在: {rid}"
-            return executor.path_for(shared_cache[rid]), None
+            return executor.path_for(path), None
 
         if value.startswith("@") and workspace is not None:
             host_path, err = workspace.resolve_ref(value)
@@ -133,7 +140,6 @@ def make_run_script_tool(registry, skills_dir, workspace=None, executor=None):
         rid = f"r_{uuid.uuid4().hex[:8]}"
         p = executor.results_dir / f"{rid}.json"
         p.write_text(stdout, encoding="utf-8")
-        shared_cache[rid] = p
         return rid
 
     @tool
@@ -197,7 +203,15 @@ def make_run_script_tool(registry, skills_dir, workspace=None, executor=None):
         if ref_errors:
             return "[参数引用失败]\n" + "\n".join(ref_errors)
 
-        # 4. 配额已超限的会话不再执行
+        # 4. skill 声明的单次运行调用次数上限（防止模型反复搜索之类）
+        limit = registry.skills[skill_name].meta.call_limits.get(script_rel_for_limit(resolved_path, skill_name))
+        key = (skill_name, script_rel_for_limit(resolved_path, skill_name))
+        if limit is not None and call_counts.get(key, 0) >= limit:
+            return (f"[次数已用完] 本次任务里 {skill_name}/{key[1]} 最多调用 {limit} 次，已经用完。"
+                    f"请基于已有的结果回答用户，并说明信息的局限。")
+        call_counts[key] = call_counts.get(key, 0) + 1
+
+        # 4.1 配额已超限的会话不再执行
         if workspace is not None:
             q_err = workspace.check_quota()
             if q_err:
@@ -217,6 +231,9 @@ def make_run_script_tool(registry, skills_dir, workspace=None, executor=None):
             return f"[执行错误] {type(e).__name__}: {e}"
         elapsed = time.monotonic() - started
 
+        if result.quota_exceeded:
+            executor.close()  # 停掉本会话的沙箱；配额没降下来之前，后续执行会在第 4 步被拒绝
+            return f"[配额超限] {workspace.check_quota() or '工作区用量超限'}，脚本已终止"
         if result.timed_out:
             return f"[超时] 脚本执行超过 {timeout} 秒，已终止"
         if result.output_truncated:
@@ -274,7 +291,6 @@ def make_run_script_tool(registry, skills_dir, workspace=None, executor=None):
         return "\n".join(parts)
 
     def cleanup():
-        shared_cache.clear()
         executor.close()
 
     return execute_skill_script, cleanup

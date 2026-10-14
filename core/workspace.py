@@ -13,6 +13,7 @@ Agent 运行时工作区管理。
 - 大小可控：单文件、单目录、总配额可设置
 - 生命周期清晰：run 结束统一清理（outputs 可选保留或上传）
 """
+import os
 import shutil
 import tempfile
 import uuid
@@ -22,6 +23,11 @@ from pathlib import Path
 # 默认配额
 DEFAULT_MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB 单文件
 DEFAULT_MAX_TOTAL_SIZE = 2 * 1024 * 1024 * 1024  # 2GB 总量
+
+
+def workspaces_root() -> Path:
+    """工作副本所在的目录：默认是项目下的 workspaces/，可用 WORKSPACES_DIR 改到别处。"""
+    return Path(os.getenv("WORKSPACES_DIR") or Path(__file__).parent.parent / "workspaces")
 
 
 class Workspace:
@@ -34,8 +40,7 @@ class Workspace:
         max_total_size: int = DEFAULT_MAX_TOTAL_SIZE,
     ):
         self.run_id = run_id or f"run_{uuid.uuid4().hex[:8]}"
-        _project_root = Path(__file__).parent.parent
-        self.root = _project_root / "workspaces" / f"agent_{self.run_id}"
+        self.root = workspaces_root() / f"agent_{self.run_id}"
         self.inputs_dir = self.root / "inputs"
         self.workspace_dir = self.root / "workspace"
         self.outputs_dir = self.root / "outputs"

@@ -32,6 +32,7 @@ class SkillMeta:
     description: str
     triggers: list = field(default_factory=list)
     network: bool = False  # 沙箱内是否允许联网
+    call_limits: dict = field(default_factory=dict)  # 每次运行里各脚本最多调用几次，如 {"scripts/search.py": 2}
 
 
 class Skill:
@@ -71,6 +72,10 @@ class Skill:
             description=description,
             triggers=fm.get("triggers", []) or [],
             network=fm.get("network") is True,
+            call_limits={
+                str(k): int(v) for k, v in (fm.get("call_limits") or {}).items()
+                if isinstance(v, int) and not isinstance(v, bool) and v > 0
+            } if isinstance(fm.get("call_limits"), dict) else {},
         )
 
         return meta, content.strip()

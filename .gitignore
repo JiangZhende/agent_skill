@@ -32,3 +32,9 @@ test_*.py
 
 # 编辑器扩展安装包
 *.vsix
+
+# skill 的上传版本与审核状态（运行时数据）
+skills/.versions/
+
+# 数据库和文件存储（运行时数据）
+data/

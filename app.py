@@ -10,49 +10,30 @@ Gradio 前端：skills-based agent web UI
 import json
 import os
 import re
+import shutil
 import sys
 import argparse
-import threading
-import uuid
 import tempfile
+import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
-from core import auth, config, errors
-from core.agent import build_agent
-from core import trajectory as traj_recorder
-from core.sessions import SessionError, UserLimiter
+from core import auth, config, db, errors
+from core.sessions import SessionError, SessionService
+from core import skill_installer
 from core.skill_installer import install_from_zip, install_from_skill_md, uninstall_skill
 from core.skill_loader import SkillRegistry
-from tools import ALL_TOOLS
 from smolagents.memory import ActionStep, PlanningStep, FinalAnswerStep
 from smolagents.gradio_ui import pull_messages_from_step
 from smolagents.models import ChatMessageStreamDelta, agglomerate_stream_deltas
 
 SKILLS_DIR = PROJECT_ROOT / "skills"
 
-# 每用户的频率、并发和会话数上限（与 api.py 用同一组配置，各自计数）
-_limiter = UserLimiter(config.RATE_LIMIT_PER_MINUTE, config.MAX_CONCURRENT_RUNS_PER_USER)
-_agent_counts: dict[str, int] = {}
-_agent_counts_lock = threading.Lock()
-
-
-def _release_state(state):
-    """回收一个会话状态里的 agent（主动点"新对话"、空闲超时、关闭页面时都会走到这里）。"""
-    agent = state.pop("agent", None) if isinstance(state, dict) else None
-    if agent is None:
-        return
-    try:
-        agent.cleanup()
-    except Exception:
-        pass
-    owner = state.get("owner")
-    with _agent_counts_lock:
-        if owner in _agent_counts:
-            _agent_counts[owner] = max(0, _agent_counts[owner] - 1)
+# 会话、对话记忆和文件都在数据库和文件存储里；在 main() 里按 --skills-dir 创建
+service: SessionService = None
 
 
 def _list_skills_md() -> str:
@@ -65,8 +46,34 @@ def _list_skills_md() -> str:
         triggers = "、".join(s.meta.triggers) if s.meta.triggers else "—"
         has_scripts = (s.dir / "scripts").exists()
         icon = "📦" if has_scripts else "📄"
-        lines.append(f"- {icon} **{s.name}**：{s.meta.description}  \n  触发词: `{triggers}`")
+        version = skill_installer.active_version(s.name, SKILLS_DIR)
+        tag = f"（v{version}）" if version else ""
+        net = " 🌐" if s.meta.network else ""
+        lines.append(f"- {icon} **{s.name}**{tag}{net}：{s.meta.description}  \n  触发词: `{triggers}`")
     return "\n".join(lines)
+
+
+def _version_choices() -> list[tuple[str, str]]:
+    """未生效的版本（待审核的在前），供"发布 / 删除版本"下拉框使用。值是 name@version。"""
+    return [
+        (f"{r['name']} v{r['version']}（{skill_installer.STATUS_LABELS.get(r['status'], r['status'])}）",
+         f"{r['name']}@{r['version']}")
+        for r in skill_installer.list_versions(SKILLS_DIR) if not r["active"]
+    ]
+
+
+def _split_version(value: str) -> tuple[str, int]:
+    name, _, version = (value or "").rpartition("@")
+    if not name or not version.isdigit():
+        raise skill_installer.SkillInstallError("请先选择一个版本")
+    return name, int(version)
+
+
+def _build_skill_image(skill_dir, name):
+    """发布带 requirements.txt 的 skill 时构建它的沙箱镜像；本机执行模式下没有镜像可建。"""
+    if config.USE_DOCKER:
+        from core.executor import build_skill_image
+        build_skill_image(skill_dir, config.DOCKER_IMAGE, name=name)
 
 
 def _list_skill_names() -> list[str]:
@@ -133,54 +140,31 @@ def create_app():
         sid = session.get("id") if isinstance(session, dict) else None
         return f"会话 ID：`{sid}`" if sid else "会话 ID：发送第一条消息后生成"
 
-    def _get_or_create_agent(session, user, model_id, file_paths):
-        """首次创建 agent；之后复用，多轮对话靠 agent.memory 保持上下文。"""
-        if session.get("agent") is None:
-            try:
-                model_id = config.resolve_model(model_id)
-            except ValueError as e:
-                raise gr.Error(str(e))
-            with _agent_counts_lock:
-                if _agent_counts.get(user.name, 0) >= config.MAX_SESSIONS_PER_USER:
-                    raise gr.Error(f"会话数已达上限（{config.MAX_SESSIONS_PER_USER}），请先在其他页面点\"新对话\"或关闭它们")
-                _agent_counts[user.name] = _agent_counts.get(user.name, 0) + 1
-            outputs_dir = Path(tempfile.mkdtemp(prefix="agent_out_"))
-            try:
-                agent = build_agent(
-                    model_id=model_id,
-                    api_base=config.API_BASE,
-                    api_key=config.API_KEY,
-                    skills_dir=SKILLS_DIR,
-                    extra_tools=ALL_TOOLS,
-                    upload_files=file_paths or None,
-                    outputs_persist_to=outputs_dir,
-                    use_docker=config.USE_DOCKER,
-                    docker_image=config.DOCKER_IMAGE,
-                )
-            except BaseException:
-                with _agent_counts_lock:
-                    _agent_counts[user.name] -= 1
-                raise
-            session["owner"] = user.name
-            session["id"] = uuid.uuid4().hex[:16]
-            session["agent"] = agent
-            session["outputs_dir"] = str(outputs_dir)
-            session["is_new"] = True
-        else:
-            agent = session["agent"]
-            failed = []
-            newly_added = []
-            for f in (file_paths or []):
-                try:
-                    name = agent.workspace.add_input(f)
-                    newly_added.append(name)
-                except Exception as e:
-                    failed.append(f"{Path(f).name}: {e}")
-            if failed:
-                raise RuntimeError("部分文件上传失败：\n" + "\n".join(failed))
-            session["is_new"] = False
-            session["newly_uploaded"] = newly_added
-        return agent
+    def _session_choices(user) -> list[tuple[str, str]]:
+        """历史会话下拉框的选项：标题 + 最后使用时间。"""
+        return [
+            (f"{time.strftime('%m-%d %H:%M', time.localtime(r['last_used_at']))}  {r['title'] or '（无标题）'}",
+             r["session_id"])
+            for r in service.list_sessions(user)
+        ]
+
+    def _output_files(session, user) -> list[str]:
+        """把会话的全部产物取到本页面专用的临时目录，返回路径列表（供下载）。"""
+        sid = session.get("id")
+        if not sid:
+            return []
+        out_dir = Path(session.get("out_dir") or tempfile.mkdtemp(prefix="agent_out_"))
+        session["out_dir"] = str(out_dir)
+        shutil.rmtree(out_dir, ignore_errors=True)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        paths = []
+        for f in service.list_files(user, sid):
+            if f["area"] == "outputs":
+                paths.append(str(service.fetch_file(user, sid, "outputs", f["name"], dest_dir=out_dir)))
+        return paths
+
+    def _files_update(paths):
+        return gr.update(value=paths, visible=True) if paths else gr.update(value=None, visible=False)
 
     def on_submit(task, uploaded_files, history, session, model_id, request: gr.Request):
         if not task.strip():
@@ -190,37 +174,52 @@ def create_app():
         if len(task) > config.MAX_TASK_CHARS:
             raise gr.Error(f"任务描述过长（上限 {config.MAX_TASK_CHARS} 字符）")
         try:
-            _limiter.start_run(user)
+            handle = service.start_run(
+                user, session.get("id"),
+                None if session.get("id") else model_id,   # 模型只在新建会话时选
+                task, source="web",
+                upload_files=[f.name for f in (uploaded_files or [])],
+            )
         except SessionError as e:
+            if e.status == 404:  # 会话已被删除或过期：让用户从新对话开始，而不是卡在一个用不了的会话上
+                session.pop("id", None)
             raise gr.Error(e.message)
-        try:
-            for hist, sess, files in _run_turn(task, uploaded_files, history, session, user, model_id):
-                yield hist, sess, files, _session_label(sess)
-        finally:
-            _limiter.end_run(user)
 
-    def _run_turn(task, uploaded_files, history, session, user, model_id):
-        file_paths = [f.name for f in (uploaded_files or [])]
-        agent = _get_or_create_agent(session, user, model_id, file_paths)
-        reset_memory = session.pop("is_new", True)
-        newly_uploaded = session.pop("newly_uploaded", [])
-        if newly_uploaded:
-            names = "、".join(f"`@input:{n}`" for n in newly_uploaded)
+        session["id"] = handle.session_id
+        answer = error = None
+        events: list[dict] = []
+        try:
+            for hist, answer, error in _run_turn(handle, history, events):
+                yield hist, session, gr.update(visible=False), _session_label(session)
+        finally:
+            # 落库：对话记忆、过程、轨迹和文件。页面被关掉、生成器被中途丢弃时也会走到这里
+            service.finish_run(handle, answer=answer, error=error, events=events)
+        yield hist, session, _files_update(_output_files(session, user)), _session_label(session)
+
+    def _run_turn(handle, history, events):
+        """执行一轮对话，逐步产出 (聊天记录, 最终回答, 错误信息)。events 收集要持久化的过程。"""
+        agent = handle.agent
+        task = handle.task
+        if handle.new_inputs:
+            names = "、".join(f"`@input:{n}`" for n in handle.new_inputs)
             task = f"[本轮新上传的文件：{names}]\n{task}"
+            handle.task = task
 
         history = list(history or [])
         history.append({"role": "user", "content": task})
-        yield history, session, gr.update(visible=False)
+        answer = error = None
+        yield history, answer, error
 
+        streaming_idx = None  # index of the current streaming placeholder in history
         try:
             accumulated_deltas: list[ChatMessageStreamDelta] = []
-            streaming_idx = None  # index of the current streaming placeholder in history
-            for event in agent.run(task, stream=True, reset=reset_memory):
+            # 记忆已经从数据库恢复，所以总是接着之前的对话继续
+            for event in agent.run(task, stream=True, reset=False):
                 if isinstance(event, ChatMessageStreamDelta):
                     accumulated_deltas.append(event)
                     content = _extract_final_answer_stream(accumulated_deltas)
                     if not content:
-                        yield history, session, gr.update(visible=False)
+                        yield history, answer, error
                         continue
                     placeholder = {"role": "assistant", "content": content}
                     if streaming_idx is None:
@@ -236,30 +235,59 @@ def create_app():
                     for msg in pull_messages_from_step(
                         event, skip_model_outputs=getattr(agent, "stream_outputs", False)
                     ):
-                        history.append({"role": msg.role, "content": msg.content, **({"metadata": msg.metadata} if msg.metadata else {})})
-                yield history, session, gr.update(visible=False)
+                        item = {"role": msg.role, "content": msg.content, **({"metadata": msg.metadata} if msg.metadata else {})}
+                        history.append(item)
+                        events.append(item)
+                    if isinstance(event, FinalAnswerStep):
+                        answer = str(event.output) if event.output is not None else None
+                yield history, answer, error
         except Exception as e:
             # 把原因显示在对话里，而不是只在服务端终端打印一段堆栈
             if streaming_idx is not None:
                 history.pop(streaming_idx)
-            history.append({"role": "assistant", "content": f"⚠️ {errors.describe(e, session.get('id'))}"})
-            yield history, session, gr.update(visible=False)
-            return
-        finally:
-            traj_recorder.save(agent, task, PROJECT_ROOT / "trajectories",
-                               user=user.name, session_id=session.get("id"), source="web")
-            # 不 cleanup，保留 agent 供下一轮使用
+            error = errors.describe(e, handle.session_id)
+            history.append({"role": "assistant", "content": f"⚠️ {error}"})
+            yield history, answer, error
 
-        outputs_dir = Path(session["outputs_dir"])
-        out_files = [str(p) for p in outputs_dir.glob("*") if p.is_file()]
-        if out_files:
-            yield history, session, gr.update(value=out_files, visible=True)
-        else:
-            yield history, session, gr.update(visible=False)
+    def on_session_select(session_id, session, request: gr.Request):
+        """打开一个历史会话：恢复聊天记录和产物，之后发的消息接着它继续。"""
+        if not session_id:
+            return gr.update(), session, gr.update(), _session_label(session)
+        user = _current_user(request)
+        try:
+            detail = service.get_session(user, session_id, with_events=True)
+        except SessionError as e:
+            raise gr.Error(e.message)
+        history = []
+        for run in detail["runs"]:
+            history.append({"role": "user", "content": run["task"]})
+            history.extend(run.get("events") or [])
+            if run["error"]:
+                history.append({"role": "assistant", "content": f"⚠️ {run['error']}"})
+        session = {"id": session_id, "out_dir": session.get("out_dir")}
+        return history, session, _files_update(_output_files(session, user)), _session_label(session)
+
+    def on_sessions_refresh(session, request: gr.Request):
+        return gr.update(choices=_session_choices(_current_user(request)), value=session.get("id"))
+
+    def on_session_delete(session, request: gr.Request):
+        """删除当前会话，连同它的文件和记录。"""
+        user = _current_user(request)
+        sid = session.get("id")
+        if not sid:
+            raise gr.Error("当前没有打开的会话")
+        try:
+            service.delete_session(user, sid)
+        except SessionError as e:
+            raise gr.Error(e.message)
+        shutil.rmtree(session.get("out_dir") or "", ignore_errors=True)
+        return [], {}, gr.update(value=None, visible=False), _session_label({}), \
+            gr.update(choices=_session_choices(user), value=None)
 
     def on_clear(session):
-        _release_state(session)
-        return [], {}, gr.update(visible=False), _session_label({})
+        # 只是让页面回到空白：原来的会话还在"历史会话"里，可以随时再打开
+        shutil.rmtree(session.get("out_dir") or "", ignore_errors=True)
+        return [], {}, gr.update(value=None, visible=False), _session_label({}), gr.update(value=None)
 
     def on_upload_hint(uploaded_files):
         if not uploaded_files:
@@ -269,54 +297,102 @@ def create_app():
 
     # ── Skills 事件 ────────────────────────────────────────────────────────────
 
-    def on_skill_upload(skill_file, request: gr.Request):
-        """安装上传的 ZIP 或 SKILL.md，返回 (状态消息, skill 列表, 卸载下拉框)。"""
-        if not _current_user(request).is_admin:
-            return "⛔ 只有管理员可以安装 skill", _list_skills_md(), gr.update()
-        if skill_file is None:
-            return "请先选择文件", _list_skills_md(), gr.update()
+    def _skills_view(status: str, selected: str = None, review: str = ""):
+        """Skills 页所有操作共用的返回值：(状态消息, skill 列表, 卸载下拉框, 版本下拉框, 版本概要)。"""
+        return (
+            status,
+            _list_skills_md(),
+            gr.update(choices=_list_skill_names(), value=None),
+            gr.update(choices=_version_choices(), value=selected),
+            review,
+        )
 
+    def _admin_only(request) -> str | None:
+        return None if _current_user(request).is_admin else "⛔ 只有管理员可以管理 skill"
+
+    def on_skill_upload(skill_file, request: gr.Request):
+        """上传 ZIP 或 SKILL.md，生成一个待审核版本（不影响正在使用的 skill）。"""
+        if denied := _admin_only(request):
+            return _skills_view(denied)
+        if skill_file is None:
+            return _skills_view("请先选择文件")
+
+        user = _current_user(request).name
         path = Path(skill_file.name)
         try:
             if path.suffix.lower() == ".zip":
-                name, msg = install_from_zip(path, SKILLS_DIR)
-            elif path.name == "SKILL.md" or path.suffix.lower() == ".md":
-                name, msg = install_from_skill_md(path, SKILLS_DIR)
+                name, version, msg = install_from_zip(path, SKILLS_DIR, user=user)
+            elif path.suffix.lower() == ".md":
+                name, version, msg = install_from_skill_md(path, SKILLS_DIR, user=user)
             else:
-                return f"不支持的文件类型 '{path.suffix}'，请上传 .zip 或 SKILL.md", _list_skills_md(), gr.update()
-        except Exception as e:
-            return f"安装失败：{e}", _list_skills_md(), gr.update()
+                return _skills_view(f"不支持的文件类型 '{path.suffix}'，请上传 .zip 或 SKILL.md")
+            review = skill_installer.review_summary(name, version, SKILLS_DIR)
+        except skill_installer.SkillInstallError as e:
+            return _skills_view(f"上传失败：{e}")
+        return _skills_view(f"✅ {msg}。检查右侧的概要和脚本后，点\"发布\"才会生效。", f"{name}@{version}", review)
 
-        names = _list_skill_names()
-        return f"✅ {msg}", _list_skills_md(), gr.update(choices=names)
+    def on_version_select(value, request: gr.Request):
+        if _admin_only(request) or not value:
+            return ""
+        try:
+            return skill_installer.review_summary(*_split_version(value), SKILLS_DIR)
+        except skill_installer.SkillInstallError as e:
+            return f"{e}"
+
+    def on_version_publish(value, request: gr.Request):
+        """发布选中的版本（发布旧版本即回滚）。带依赖的 skill 会先构建镜像，可能要等一两分钟。"""
+        if denied := _admin_only(request):
+            return _skills_view(denied)
+        try:
+            name, version = _split_version(value)
+            msg = skill_installer.publish(name, version, SKILLS_DIR, user=_current_user(request).name,
+                                          build_image=_build_skill_image)
+        except skill_installer.SkillInstallError as e:
+            return _skills_view(f"发布失败：{e}")
+        except RuntimeError as e:  # 镜像构建失败：版本保持原状态
+            return _skills_view(f"发布失败：{e}", value)
+        return _skills_view(f"✅ {msg}")
+
+    def on_version_discard(value, request: gr.Request):
+        if denied := _admin_only(request):
+            return _skills_view(denied)
+        try:
+            msg = skill_installer.discard_version(*_split_version(value), SKILLS_DIR)
+        except skill_installer.SkillInstallError as e:
+            return _skills_view(f"删除失败：{e}")
+        return _skills_view(f"🗑️ {msg}")
 
     def on_skill_uninstall(skill_name, request: gr.Request):
-        """卸载选中的 skill，返回 (状态消息, skill 列表, 卸载下拉框)。"""
-        if not _current_user(request).is_admin:
-            return "⛔ 只有管理员可以卸载 skill", _list_skills_md(), gr.update()
+        """卸载选中的 skill（连同它的所有版本）。"""
+        if denied := _admin_only(request):
+            return _skills_view(denied)
         if not skill_name:
-            return "请先选择要卸载的 skill", _list_skills_md(), gr.update()
+            return _skills_view("请先选择要卸载的 skill")
         try:
             _, msg = uninstall_skill(skill_name, SKILLS_DIR)
-        except Exception as e:
-            return f"卸载失败：{e}", _list_skills_md(), gr.update()
-        names = _list_skill_names()
-        return f"🗑️ {msg}", _list_skills_md(), gr.update(choices=names, value=None)
+        except skill_installer.SkillInstallError as e:
+            return _skills_view(f"卸载失败：{e}")
+        return _skills_view(f"🗑️ {msg}")
 
-    def on_skill_refresh():
-        names = _list_skill_names()
-        return _list_skills_md(), gr.update(choices=names)
+    def on_skill_refresh(request: gr.Request):
+        view = _skills_view("")
+        # 版本列表只给管理员
+        return view if not _admin_only(request) else (view[0], view[1], view[2], gr.update(choices=[]), "")
 
     def on_page_load(request: gr.Request):
         """按登录用户的角色决定是否显示 skill 的安装 / 卸载区（真正的权限校验在上面的处理函数里）。"""
-        is_admin = _current_user(request).is_admin
-        return gr.update(visible=is_admin), gr.update(visible=not is_admin)
+        user = _current_user(request)
+        is_admin = user.is_admin
+        # 版本列表和历史会话在这里按用户填充，不放进所有人都能拿到的页面初始配置里
+        versions = gr.update(choices=_version_choices() if is_admin else [])
+        sessions = gr.update(choices=_session_choices(user), value=None)
+        return gr.update(visible=is_admin), gr.update(visible=not is_admin), versions, sessions
 
     # ── 界面布局 ───────────────────────────────────────────────────────────────
 
     with gr.Blocks(title="Agent Skills", fill_height=True) as demo:
-        # 空闲超时或页面关闭后，Gradio 删除状态时回收 agent 和沙箱
-        session_state = gr.State({}, time_to_live=config.SESSION_IDLE_TTL, delete_callback=_release_state)
+        # 页面只记住当前打开的是哪个会话；会话内容都在服务端
+        session_state = gr.State({})
 
         with gr.Tabs():
 
@@ -343,6 +419,15 @@ def create_app():
                         )
                         upload_hint = gr.Markdown("未上传文件")
                         session_info = gr.Markdown(_session_label({}))
+
+                        gr.Markdown("---")
+                        session_dropdown = gr.Dropdown(
+                            label="历史会话（选中即可继续）",
+                            choices=[],
+                            value=None,
+                            allow_custom_value=True,
+                        )
+                        delete_btn = gr.Button("删除当前会话", variant="stop", size="sm")
 
                         gr.Markdown("---")
                         output_files = gr.File(
@@ -376,75 +461,99 @@ def create_app():
                     inputs=[task_input, file_upload, chatbot, session_state, model_id_input],
                     outputs=[chatbot, session_state, output_files, session_info],
                 )
-                send_btn.click(**submit_kwargs)
-                task_input.submit(**submit_kwargs)
+                refresh_kwargs = dict(fn=on_sessions_refresh, inputs=[session_state], outputs=[session_dropdown])
+                send_btn.click(**submit_kwargs).then(**refresh_kwargs)
+                task_input.submit(**submit_kwargs).then(**refresh_kwargs)
                 clear_btn.click(on_clear, inputs=[session_state],
-                                outputs=[chatbot, session_state, output_files, session_info])
+                                outputs=[chatbot, session_state, output_files, session_info, session_dropdown])
+                session_dropdown.input(on_session_select, inputs=[session_dropdown, session_state],
+                                       outputs=[chatbot, session_state, output_files, session_info])
+                delete_btn.click(on_session_delete, inputs=[session_state],
+                                 outputs=[chatbot, session_state, output_files, session_info, session_dropdown])
 
             # ── Tab 2: Skills 管理 ─────────────────────────────────────────────
             with gr.Tab("🧩 Skills 管理"):
                 with gr.Row():
 
                     with gr.Column(scale=1, min_width=320, visible=False) as admin_col:
-                        gr.Markdown("### 安装新 Skill")
+                        gr.Markdown("### 上传 Skill")
                         gr.Markdown(
-                            "支持两种格式：\n"
-                            "- **ZIP**：包含 `SKILL.md` + `scripts/` 目录\n"
+                            "上传后是**待审核**状态，不影响正在使用的 skill；发布后才生效。"
+                            "再次上传同名 skill 会新增一个版本，不会覆盖。\n\n"
+                            "- **ZIP**：`SKILL.md` + `scripts/` 等，可带一个顶层目录；"
+                            "上限 10MB、200 个文件\n"
                             "- **SKILL.md**：单文件，适合无脚本的 skill\n\n"
-                            "ZIP 结构示例：\n"
-                            "```\n"
-                            "my_skill.zip\n"
-                            "├── my_skill/\n"
-                            "│   ├── SKILL.md\n"
-                            "│   └── scripts/\n"
-                            "│       └── run.py\n"
-                            "```"
+                            "skill 名以 SKILL.md 里的 `name` 为准。需要额外 Python 包时放一个 "
+                            "`requirements.txt`，发布时会为它构建镜像。"
                         )
                         skill_file_input = gr.File(
                             label="上传 ZIP 或 SKILL.md",
                             file_types=[".zip", ".md"],
                         )
-                        install_btn = gr.Button("安装 Skill", variant="primary")
-                        install_status = gr.Markdown("")
+                        install_btn = gr.Button("上传", variant="primary")
+
+                        gr.Markdown("---")
+                        gr.Markdown("### 审核与版本")
+                        version_dropdown = gr.Dropdown(
+                            label="未生效的版本（待审核的在前）",
+                            choices=[],
+                            value=None,
+                            # 选项随上传和发布变化；合法性由处理函数自己校验，不依赖框架记住的选项列表
+                            allow_custom_value=True,
+                        )
+                        with gr.Row():
+                            publish_btn = gr.Button("发布 / 回滚到此版本", variant="primary")
+                            discard_btn = gr.Button("删除此版本", variant="stop")
 
                         gr.Markdown("---")
                         gr.Markdown("### 卸载 Skill")
                         uninstall_dropdown = gr.Dropdown(
-                            label="选择要卸载的 Skill",
+                            label="选择要卸载的 Skill（连同所有版本）",
                             choices=_list_skill_names(),
                             value=None,
+                            allow_custom_value=True,
                         )
                         uninstall_btn = gr.Button("卸载 Skill", variant="stop")
-                        uninstall_status = gr.Markdown("")
 
                     with gr.Column(scale=2):
-                        admin_notice = gr.Markdown("_安装和卸载 skill 需要管理员账号。_", visible=False)
-                        gr.Markdown("### 已安装 Skills")
+                        admin_notice = gr.Markdown("_上传、发布和卸载 skill 需要管理员账号。_", visible=False)
+                        skill_status = gr.Markdown("")
+                        version_review = gr.Markdown("")
+                        gr.Markdown("### 已生效的 Skills")
                         refresh_btn = gr.Button("🔄 刷新列表", size="sm")
                         skills_list = gr.Markdown(_list_skills_md())
 
-                install_btn.click(
-                    on_skill_upload,
-                    inputs=[skill_file_input],
-                    outputs=[install_status, skills_list, uninstall_dropdown],
-                )
-                uninstall_btn.click(
-                    on_skill_uninstall,
-                    inputs=[uninstall_dropdown],
-                    outputs=[uninstall_status, skills_list, uninstall_dropdown],
-                )
-                refresh_btn.click(
-                    on_skill_refresh,
-                    outputs=[skills_list, uninstall_dropdown],
-                )
+                view_outputs = [skill_status, skills_list, uninstall_dropdown, version_dropdown, version_review]
+                install_btn.click(on_skill_upload, inputs=[skill_file_input], outputs=view_outputs)
+                version_dropdown.change(on_version_select, inputs=[version_dropdown], outputs=[version_review])
+                publish_btn.click(on_version_publish, inputs=[version_dropdown], outputs=view_outputs)
+                discard_btn.click(on_version_discard, inputs=[version_dropdown], outputs=view_outputs)
+                uninstall_btn.click(on_skill_uninstall, inputs=[uninstall_dropdown], outputs=view_outputs)
+                refresh_btn.click(on_skill_refresh, outputs=view_outputs)
 
-        demo.load(on_page_load, outputs=[admin_col, admin_notice])
+        demo.load(on_page_load, outputs=[admin_col, admin_notice, version_dropdown, session_dropdown])
 
     return demo
 
 
+def _start_sweeper():
+    """后台线程：定期回收空闲会话的沙箱和工作副本，删除过期会话。"""
+    import threading
+
+    def loop():
+        while True:
+            time.sleep(60)
+            try:
+                service.sweep()
+            except Exception:
+                import logging
+                logging.getLogger("agent.web").exception("session sweep failed")
+
+    threading.Thread(target=loop, daemon=True, name="session-sweeper").start()
+
+
 def main():
-    global SKILLS_DIR
+    global SKILLS_DIR, service
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--share", action="store_true")
@@ -454,10 +563,14 @@ def main():
     if args.skills_dir:
         SKILLS_DIR = args.skills_dir.resolve()
 
+    db.get_engine()           # 连接数据库并升级表结构
     auth.check_startup()
     if config.USE_DOCKER:
         from core.executor import cleanup_orphans
         cleanup_orphans()  # 上次进程崩溃后遗留的沙箱容器
+    service = SessionService(skills_dir=SKILLS_DIR)
+    service.startup()
+    _start_sweeper()
 
     launch_kwargs = {}
     if not auth.auth_disabled():

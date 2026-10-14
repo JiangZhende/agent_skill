@@ -13,7 +13,9 @@ from smolagents import ToolCallingAgent, OpenAIServerModel
 
 from core.skill_loader import SkillRegistry
 from core.workspace import Workspace
+from core import config, context
 from core.executor import make_executor
+from core.run_limits import RunGuard, make_plan_tool
 from tools.run_script import make_run_script_tool
 from tools.load_skill import make_load_skill_tool
 from tools.read_resource import make_read_resource_tool
@@ -98,13 +100,16 @@ def build_agent(
     api_key: str | None = None,
     skills_dir: Path = Path("skills"),
     extra_tools: list = None,
-    max_steps: int = 10,
+    max_steps: int = None,
     upload_files: list = None,
     outputs_persist_to: Path = None,
     use_docker: bool = False,
     docker_image: str = "agent-sandbox:latest",
 ):
-    """构建一个 skills-based ToolCallingAgent。
+    """构建一个自带 workspace 和执行器的 agent（命令行、脚本和测试用）。
+
+    服务端入口不用这个函数：它们的 workspace 和执行器属于会话（见 core/runtime.py），
+    agent 每次运行时用 assemble_agent 现建。
 
     Args:
         upload_files: 用户上传的文件列表
@@ -122,23 +127,88 @@ def build_agent(
             except Exception as e:
                 print(f"[upload error] {f}: {e}")
 
-    load_skill_tool = make_load_skill_tool(registry)
     executor = make_executor(use_docker=use_docker, docker_image=docker_image, workspace=workspace)
-    run_script_tool, run_script_cleanup = make_run_script_tool(
+    agent = assemble_agent(
+        registry=registry, skills_dir=skills_dir, workspace=workspace, executor=executor,
+        model_id=model_id, api_base=api_base, api_key=api_key,
+        extra_tools=extra_tools, max_steps=max_steps,
+    )
+
+    def cleanup_all():
+        executor.close()
+        workspace.cleanup(
+            keep_outputs=bool(outputs_persist_to),
+            outputs_persist_to=outputs_persist_to,
+        )
+
+    agent.cleanup = cleanup_all
+    return agent
+
+
+def _fix_stream_token_usage(model):
+    """修正流式输出时的 token 用量。
+
+    有的模型服务（如硅基流动）在流式输出的大量分片里都带一份"截至目前的累计用量"，
+    smolagents 会把它们全部相加，结果被放大上百倍。这里把用量当作累计值处理：
+    中间分片的用量去掉，流结束后补一个只带最后一次用量的分片。
+    只在最后一个分片带用量的服务（OpenAI 的做法）上，结果与原来一致。
+    """
+    from smolagents.models import ChatMessageStreamDelta
+
+    original = model.generate_stream
+
+    def generate_stream(*args, **kwargs):
+        last_usage = None
+        for delta in original(*args, **kwargs):
+            if delta.token_usage is not None:
+                last_usage = delta.token_usage
+                delta.token_usage = None
+            yield delta
+        if last_usage is not None:
+            yield ChatMessageStreamDelta(content=None, token_usage=last_usage)
+
+    model.generate_stream = generate_stream
+
+
+def assemble_agent(
+    registry: SkillRegistry,
+    skills_dir: Path,
+    workspace: Workspace,
+    executor,
+    model_id: str,
+    api_base: str | None = None,
+    api_key: str | None = None,
+    extra_tools: list = None,
+    max_steps: int = None,
+):
+    """用现成的会话级资源（skill 注册表、workspace、执行器）装配一个 agent。
+
+    agent 本身只持有模型连接、对话记忆和工具列表，可以随用随建；
+    workspace 和执行器由调用方负责创建和回收。
+    """
+    load_skill_tool = make_load_skill_tool(registry)
+    run_script_tool, _ = make_run_script_tool(
         registry, skills_dir, workspace=workspace, executor=executor,
     )
     read_resource_tool = make_read_resource_tool(registry, skills_dir)
     workspace_tools = make_workspace_tools(workspace)
 
-    builtin_tools = [load_skill_tool, run_script_tool, read_resource_tool] + workspace_tools
+    # 预算与防空转：每一步结束时检查；计划工具把清单交给它，停止时用来列出未完成项
+    guard = RunGuard(max_steps=max_steps or config.MAX_STEPS,
+                     token_budget=config.RUN_TOKEN_BUDGET, time_budget=config.RUN_TIME_BUDGET)
+    builtin_tools = [load_skill_tool, run_script_tool, read_resource_tool, make_plan_tool(guard)] + workspace_tools
 
     model = OpenAIServerModel(model_id=model_id, api_base=api_base, api_key=api_key)
     agent = ToolCallingAgent(
         tools=builtin_tools + (extra_tools or []),
         model=model,
-        max_steps=max_steps,
+        max_steps=guard.max_steps,
         stream_outputs=True,
     )
+    _fix_stream_token_usage(agent.model)
+    guard.attach(agent)
+    # 组装发给模型的消息时使用压缩视图；完整记忆照样保存
+    context.install(agent, config.CONTEXT_BUDGET_CHARS)
 
     # 完全替换 smolagents 默认模板，使用纯中文自定义模板
     skill_section = _build_skill_section(registry)
@@ -149,14 +219,7 @@ def build_agent(
     custom_prompt = custom_prompt.replace("CURRENT_DATE_PLACEHOLDER", today)
     agent.prompt_templates["system_prompt"] = custom_prompt
 
-    def cleanup_all():
-        run_script_cleanup()
-        workspace.cleanup(
-            keep_outputs=bool(outputs_persist_to),
-            outputs_persist_to=outputs_persist_to,
-        )
-
-    agent.cleanup = cleanup_all
+    agent.cleanup = lambda: None   # 资源归调用方所有
     agent.workspace = workspace
 
     # 当 parse_tool_calls 解析 JSON tool call 失败时：

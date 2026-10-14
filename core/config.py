@@ -40,16 +40,27 @@ MODEL_ID = _models()[0]
 API_BASE = os.getenv("API_BASE", "https://api.siliconflow.cn/v1/").strip()
 API_KEY = os.getenv("API_KEY") or ""
 
-USE_DOCKER = _flag("USE_DOCKER")
+# 默认启用沙箱；本机直接执行脚本要显式设 USE_DOCKER=0（仅开发）
+USE_DOCKER = os.getenv("USE_DOCKER", "1").strip().lower() in ("1", "true", "yes")
 DOCKER_IMAGE = os.getenv("DOCKER_IMAGE", "agent-sandbox:latest")
 IS_PRODUCTION = os.getenv("AGENT_ENV", "development").strip().lower() == "production"
 
 # 会话与限流
-SESSION_IDLE_TTL = _int("SESSION_IDLE_TTL", 1800)            # 会话空闲多少秒后回收
+SESSION_IDLE_TTL = _int("SESSION_IDLE_TTL", 1800)            # 会话空闲多少秒后回收它的沙箱和工作副本
+# 每用户同时保留沙箱和工作副本的会话数；超出时回收最久未用的（内容已持久化，随时可恢复）
 MAX_SESSIONS_PER_USER = _int("MAX_SESSIONS_PER_USER", 5)
+SESSION_RETENTION_DAYS = _int("SESSION_RETENTION_DAYS", 30)  # 会话多久不用后连同文件一起删除，0 为永久保留
+TRAJECTORY_JSONL = _flag("TRAJECTORY_JSONL") if os.getenv("TRAJECTORY_JSONL") else True  # 是否同时写 trajectories/*.jsonl
 MAX_CONCURRENT_RUNS_PER_USER = _int("MAX_CONCURRENT_RUNS_PER_USER", 2)
 RATE_LIMIT_PER_MINUTE = _int("RATE_LIMIT_PER_MINUTE", 30)    # 每用户每分钟的请求数
 MAX_TASK_CHARS = _int("MAX_TASK_CHARS", 20000)
+
+# 单次运行的预算：任一用完就停止，并让模型交代做完了什么、还剩什么
+MAX_STEPS = _int("MAX_STEPS", 15)
+RUN_TOKEN_BUDGET = _int("RUN_TOKEN_BUDGET", 300000)   # 一次运行累计消耗的 token（输入 + 输出），0 为不限
+RUN_TIME_BUDGET = _int("RUN_TIME_BUDGET", 300)        # 一次运行的总时长（秒），0 为不限
+# 每次调用模型时放进去的历史上限（字符数）；超出时压缩较早的内容，完整记录仍保存在数据库里
+CONTEXT_BUDGET_CHARS = _int("CONTEXT_BUDGET_CHARS", 40000)
 
 
 def allowed_models() -> list[str]:
