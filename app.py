@@ -26,9 +26,6 @@ from core.sessions import SessionError, SessionService
 from core import skill_installer
 from core.skill_installer import install_from_zip, install_from_skill_md, uninstall_skill
 from core.skill_loader import SkillRegistry
-from smolagents.memory import ActionStep, PlanningStep, FinalAnswerStep
-from smolagents.gradio_ui import pull_messages_from_step
-from smolagents.models import ChatMessageStreamDelta, agglomerate_stream_deltas
 
 SKILLS_DIR = PROJECT_ROOT / "skills"
 
@@ -81,50 +78,6 @@ def _list_skill_names() -> list[str]:
     return sorted(SkillRegistry(SKILLS_DIR).skills.keys())
 
 
-def _extract_final_answer_stream(accumulated: list[ChatMessageStreamDelta]) -> str:
-    """从累积的 ChatMessageStreamDelta 中提取 final_answer 的 answer 文本。
-    支持 native tool call（delta.tool_calls）和 content JSON 两种模型输出路径。
-    """
-    msg = agglomerate_stream_deltas(accumulated)
-
-    # native tool call 路径：arguments 在 tool_calls 里
-    if msg.tool_calls:
-        tc = msg.tool_calls[0]
-        if tc.function.name == "final_answer":
-            raw_args = tc.function.arguments or ""
-            # 尝试解析完整 JSON
-            try:
-                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                return args.get("answer", "") if isinstance(args, dict) else ""
-            except json.JSONDecodeError:
-                # 部分截断：从原始字符串提取 answer 值
-                m = re.search(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)', raw_args)
-                if m:
-                    partial = m.group(1)
-                    partial = re.sub(r'\\u([0-9a-fA-F]{4})', lambda x: chr(int(x.group(1), 16)), partial)
-                    return partial.replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\")
-        return f"🔧 {tc.function.name}..."
-
-    # content JSON 路径：模型把 JSON tool call 输出在 content 里
-    if msg.content:
-        content = msg.content.strip()
-        if not content.startswith("{"):
-            return content
-        tool_m = re.search(r'"(?:name|tool)"\s*:\s*"([^"]+)"', content)
-        if not tool_m or tool_m.group(1) != "final_answer":
-            return f"🔧 {tool_m.group(1)}..." if tool_m else ""
-        m = re.search(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)', content)
-        if m:
-            partial = m.group(1)
-            try:
-                return json.loads(f'"{partial}"')
-            except json.JSONDecodeError:
-                partial = re.sub(r'\\u([0-9a-fA-F]{4})', lambda x: chr(int(x.group(1), 16)), partial)
-                return partial.replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\")
-
-    return ""
-
-
 def create_app():
     import gradio as gr
 
@@ -167,6 +120,11 @@ def create_app():
         return gr.update(value=paths, visible=True) if paths else gr.update(value=None, visible=False)
 
     def on_submit(task, uploaded_files, history, session, model_id, request: gr.Request):
+        """提交运行，然后从数据库读取运行事件并显示。
+
+        运行由 worker 执行，不在这个页面的请求里：页面关掉或刷新后运行照常继续，
+        重新打开该会话就能看到结果。
+        """
         if not task.strip():
             yield history, session, gr.update(), _session_label(session)
             return
@@ -174,7 +132,7 @@ def create_app():
         if len(task) > config.MAX_TASK_CHARS:
             raise gr.Error(f"任务描述过长（上限 {config.MAX_TASK_CHARS} 字符）")
         try:
-            handle = service.start_run(
+            session_id, run_id = service.submit(
                 user, session.get("id"),
                 None if session.get("id") else model_id,   # 模型只在新建会话时选
                 task, source="web",
@@ -185,69 +143,49 @@ def create_app():
                 session.pop("id", None)
             raise gr.Error(e.message)
 
-        session["id"] = handle.session_id
-        answer = error = None
-        events: list[dict] = []
-        try:
-            for hist, answer, error in _run_turn(handle, history, events):
-                yield hist, session, gr.update(visible=False), _session_label(session)
-        finally:
-            # 落库：对话记忆、过程、轨迹和文件。页面被关掉、生成器被中途丢弃时也会走到这里
-            service.finish_run(handle, answer=answer, error=error, events=events)
-        yield hist, session, _files_update(_output_files(session, user)), _session_label(session)
-
-    def _run_turn(handle, history, events):
-        """执行一轮对话，逐步产出 (聊天记录, 最终回答, 错误信息)。events 收集要持久化的过程。"""
-        agent = handle.agent
-        task = handle.task
-        if handle.new_inputs:
-            names = "、".join(f"`@input:{n}`" for n in handle.new_inputs)
-            task = f"[本轮新上传的文件：{names}]\n{task}"
-            handle.task = task
-
+        session["id"], session["run_id"] = session_id, run_id
         history = list(history or [])
         history.append({"role": "user", "content": task})
-        answer = error = None
-        yield history, answer, error
+        yield history, session, gr.update(visible=False), _session_label(session)
 
-        streaming_idx = None  # index of the current streaming placeholder in history
-        try:
-            accumulated_deltas: list[ChatMessageStreamDelta] = []
-            # 记忆已经从数据库恢复，所以总是接着之前的对话继续
-            for event in agent.run(task, stream=True, reset=False):
-                if isinstance(event, ChatMessageStreamDelta):
-                    accumulated_deltas.append(event)
-                    content = _extract_final_answer_stream(accumulated_deltas)
-                    if not content:
-                        yield history, answer, error
-                        continue
-                    placeholder = {"role": "assistant", "content": content}
-                    if streaming_idx is None:
-                        history.append(placeholder)
-                        streaming_idx = len(history) - 1
-                    else:
-                        history[streaming_idx] = placeholder
-                elif isinstance(event, (ActionStep, PlanningStep, FinalAnswerStep)):
-                    accumulated_deltas = []
-                    if streaming_idx is not None:
-                        history.pop(streaming_idx)
-                        streaming_idx = None
-                    for msg in pull_messages_from_step(
-                        event, skip_model_outputs=getattr(agent, "stream_outputs", False)
-                    ):
-                        item = {"role": msg.role, "content": msg.content, **({"metadata": msg.metadata} if msg.metadata else {})}
+        after, token_idx = 0, None
+        while True:
+            batch = service.read_events(user, run_id, after)
+            for ev in batch:
+                after = ev["seq"]
+                if ev["type"] == "token":
+                    item = {"role": "assistant", "content": ev["content"]}
+                    if token_idx is None:
                         history.append(item)
-                        events.append(item)
-                    if isinstance(event, FinalAnswerStep):
-                        answer = str(event.output) if event.output is not None else None
-                yield history, answer, error
-        except Exception as e:
-            # 把原因显示在对话里，而不是只在服务端终端打印一段堆栈
-            if streaming_idx is not None:
-                history.pop(streaming_idx)
-            error = errors.describe(e, handle.session_id)
-            history.append({"role": "assistant", "content": f"⚠️ {error}"})
-            yield history, answer, error
+                        token_idx = len(history) - 1
+                    else:
+                        history[token_idx] = item
+                    continue
+                if token_idx is not None:   # 步骤完成后，流式的临时回答被正式的步骤替换
+                    history.pop(token_idx)
+                    token_idx = None
+                if ev["type"] == "step":
+                    history.append({k: ev[k] for k in ("role", "content", "metadata") if k in ev})
+                elif ev["type"] == "error":
+                    history.append({"role": "assistant", "content": f"⚠️ {ev['content']}"})
+                elif ev["type"] == "done":
+                    if ev.get("status") == "cancelled":
+                        history.append({"role": "assistant", "content": "⏹️ 已停止"})
+                    session.pop("run_id", None)
+                    yield history, session, _files_update(_output_files(session, user)), _session_label(session)
+                    return
+            yield history, session, gr.update(visible=False), _session_label(session)
+            if not batch:
+                time.sleep(0.2)
+
+    def on_stop(session, request: gr.Request):
+        """停止当前会话正在进行的运行（在下一个检查点停下，正在执行的脚本会先跑完）。"""
+        run_id = session.get("run_id")
+        if run_id:
+            try:
+                service.cancel(_current_user(request), run_id)
+            except SessionError as e:
+                raise gr.Error(e.message)
 
     def on_session_select(session_id, session, request: gr.Request):
         """打开一个历史会话：恢复聊天记录和产物，之后发的消息接着它继续。"""
@@ -410,6 +348,7 @@ def create_app():
                         )
                         with gr.Row():
                             send_btn = gr.Button("发送", variant="primary", scale=3)
+                            stop_btn = gr.Button("停止", scale=1)
                             clear_btn = gr.Button("新对话", scale=1)
 
                         gr.Markdown("---")
@@ -464,6 +403,7 @@ def create_app():
                 refresh_kwargs = dict(fn=on_sessions_refresh, inputs=[session_state], outputs=[session_dropdown])
                 send_btn.click(**submit_kwargs).then(**refresh_kwargs)
                 task_input.submit(**submit_kwargs).then(**refresh_kwargs)
+                stop_btn.click(on_stop, inputs=[session_state])
                 clear_btn.click(on_clear, inputs=[session_state],
                                 outputs=[chatbot, session_state, output_files, session_info, session_dropdown])
                 session_dropdown.input(on_session_select, inputs=[session_dropdown, session_state],
@@ -542,7 +482,7 @@ def _start_sweeper():
 
     def loop():
         while True:
-            time.sleep(60)
+            time.sleep(15)
             try:
                 service.sweep()
             except Exception:
@@ -565,11 +505,16 @@ def main():
 
     db.get_engine()           # 连接数据库并升级表结构
     auth.check_startup()
-    if config.USE_DOCKER:
-        from core.executor import cleanup_orphans
-        cleanup_orphans()  # 上次进程崩溃后遗留的沙箱容器
     service = SessionService(skills_dir=SKILLS_DIR)
-    service.startup()
+    if config.WORKER_MODE == "embedded":
+        # 进程内的 worker：开发和单机部署时不用另起进程。
+        # WORKER_MODE=external 时由 `python -m core.worker` 执行，本进程不碰 Docker
+        from core.worker import Worker
+        if config.USE_DOCKER:
+            from core.executor import cleanup_orphans
+            cleanup_orphans()  # 上次进程崩溃后遗留的沙箱容器
+        service.startup()
+        Worker(service).start()
     _start_sweeper()
 
     launch_kwargs = {}

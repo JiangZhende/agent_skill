@@ -86,7 +86,6 @@ class RuntimePool:
         if rt is None:
             workspace = Workspace(run_id=WORKSPACE_PREFIX + session_id)
             (Path(workspace.root) / OWNER_FILE).write_text(worker_id(), encoding="utf-8")
-            session_files.sync_down(session_id, workspace)
             executor = make_executor(use_docker=self.use_docker, docker_image=self.docker_image,
                                      workspace=workspace)
             rt = SessionRuntime(session_id=session_id, owner=owner, workspace=workspace, executor=executor)
@@ -95,6 +94,13 @@ class RuntimePool:
         with self._lock:
             rt.busy = True
             rt.last_used = time.monotonic()
+        # 每次都和文件存储对一遍，不只是新建工作副本时：工作副本缓存期间，用户可能通过 API
+        # 或另一个进程上传了同名的新文件。不更新的话，运行结束时旧内容会被同步回去，覆盖新上传的
+        try:
+            session_files.sync_down(session_id, rt.workspace)
+        except BaseException:
+            self.release(rt)
+            raise
         return rt
 
     def release(self, rt: SessionRuntime):

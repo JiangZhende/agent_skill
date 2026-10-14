@@ -57,7 +57,7 @@
  └─────────────────────────────────────────────────────────────┘
 ```
 
-`app.py` 和 `api.py` 共用同一个会话服务（`core/sessions.py`）和同一个数据库，所以在网页上开始的对话可以用 API 接着做，反过来也行。agent 不常驻内存：每条消息到来时现建一个，从数据库恢复对话记忆，跑完把新增的记忆、过程和文件存回去。服务重启（包括被强杀）之后，会话可以原样继续。
+`app.py` 和 `api.py` 共用同一个会话服务（`core/sessions.py`）和同一个数据库，所以在网页上开始的对话可以用 API 接着做，反过来也行。入口只负责把任务排进数据库里的队列，由 worker（默认就在入口进程里，也可以单独部署）领取执行，过程写成事件供入口读取。agent 不常驻内存：每次运行时现建一个，从数据库恢复对话记忆，跑完把新增的记忆、过程和文件存回去。服务重启（包括被强杀）之后，会话可以原样继续。
 
 上传文件和 Skill 管理目前只有 `app.py` 提供；`main.py` 是不经过会话服务的独立示例。
 
@@ -84,12 +84,14 @@ agent_skills_poc/
 │   ├── storage.py          # 文件存储（本地目录 / S3）
 │   ├── auth.py             # 用户表与 token 鉴权（python -m core.auth 管理用户）
 │   ├── config.py           # 服务端配置（模型地址和密钥、各项上限）
-│   ├── sessions.py         # 会话服务：归属校验、运行的开始与落库、回收（两个入口共用）
+│   ├── sessions.py         # 会话服务：提交、领取、执行、落库、取消、租约（入口和 worker 共用）
 │   ├── executor.py         # 脚本执行器：DockerExecutor（沙箱）/ LocalExecutor（开发）
 │   ├── skill_loader.py     # SKILL.md 解析与 SkillRegistry
 │   ├── skill_installer.py  # skill 的上传校验、审核发布、版本与卸载
 │   ├── trajectory.py       # 运行轨迹序列化为 JSONL
-│   └── workspace.py        # 运行时文件隔离（inputs / workspace / outputs）
+│   ├── workspace.py        # 运行时文件隔离（inputs / workspace / outputs）
+│   ├── worker.py           # 运行队列的 worker（python -m core.worker）
+│   └── events.py           # 运行事件的写入与读取（SSE 和 Web UI 共用）
 ├── tools/
 │   ├── run_script.py       # 执行 skill 内脚本（校验、@引用解析，执行交给 executor）
 │   ├── load_skill.py       # 加载 skill 详情
@@ -171,7 +173,20 @@ python app.py --skills-dir test_skills   # 指定其他 skill 目录（测试用
 uvicorn api:app --port 8000
 ```
 
-请求头带 `Authorization: Bearer <token>`，用法见下方 [API](#api) 一节。Web UI 和 API 是两个独立的进程，可以同时运行，共用同一份用户表。
+请求头带 `Authorization: Bearer <token>`，用法见下方 [API](#api) 一节。Web UI 和 API 是两个独立的进程，可以同时运行，共用同一个数据库。
+
+### 单独运行 worker（多副本部署）
+
+默认（`WORKER_MODE=embedded`）Web UI 和 API 进程里各自带着 worker 线程，执行用户的任务，单机不用另外起进程。要跑多个入口副本，或者不想让入口进程接触 Docker 时：
+
+```bash
+# .env 里设 WORKER_MODE=external，然后
+python -m core.worker --threads 4      # 可以起多个，分布在多台机器上
+uvicorn api:app --port 8000            # 入口副本 1
+uvicorn api:app --port 8001            # 入口副本 2
+```
+
+此时入口进程只负责排队和转发事件，只有 worker 需要 Docker 权限。所有进程要指向同一个数据库和文件存储（多台机器时用 Postgres 和 S3 / MinIO），`skills/` 目录也要共享（例如挂同一个卷）。详见 [运行队列](#运行队列)。
 
 ### Docker 沙箱
 
@@ -190,7 +205,7 @@ docker info        # macOS 上用 colima 时先 colima start
 
 ### 停止
 
-前台运行时按 `Ctrl+C`。服务退出时会回收所有会话的 workspace 和沙箱容器；如果进程被强杀，遗留的容器会在下次启动时清理。
+前台运行时按 `Ctrl+C`。worker 会停止领取新任务，等正在执行的任务结束后再退出，并回收工作副本和沙箱容器。进程被强杀时，它正在执行的任务会在租约过期后（默认 60 秒内）被标为"中断"并解锁会话，遗留的容器在下次启动时清理。
 
 ### 启动失败时
 
@@ -266,7 +281,7 @@ python -m core.auth remove bob
 ```bash
 TOKEN=<创建用户时得到的 token>
 
-# 新建会话并执行；响应头 X-Session-Id 是会话 id
+# 提交并等待：返回 SSE 流；响应头 X-Session-Id 是会话 id，X-Run-Id 是这次运行的编号
 curl -N -D - -X POST http://localhost:8000/run \
      -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
      -d '{"task": "用一句话介绍你自己"}'
@@ -275,20 +290,86 @@ curl -N -D - -X POST http://localhost:8000/run \
 curl -N -X POST http://localhost:8000/run \
      -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
      -d '{"task": "再详细一点", "session_id": "<X-Session-Id>"}'
+
+# 先上传文件再提问
+SID=$(curl -s -X POST http://localhost:8000/sessions -H "Authorization: Bearer $TOKEN" | jq -r .session_id)
+curl -X POST http://localhost:8000/sessions/$SID/files -H "Authorization: Bearer $TOKEN" -F "files=@sales.csv"
+curl -N -X POST http://localhost:8000/run -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d "{\"task\": \"把上传的 CSV 转成 Excel\", \"session_id\": \"$SID\"}"
+
+# 长任务：只提交，之后再看
+RUN=$(curl -s -X POST http://localhost:8000/runs -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" -d '{"task": "..."}' | jq -r .run_id)
+curl -s http://localhost:8000/runs/$RUN -H "Authorization: Bearer $TOKEN"              # 状态和回答
+curl -N http://localhost:8000/runs/$RUN/events -H "Authorization: Bearer $TOKEN"       # 事件流
 ```
+
+**运行**
 
 | 接口 | 说明 |
 |---|---|
-| `POST /run` | 执行任务，返回 SSE 流。请求体只有 `task`、`session_id`（可选）、`model_id`（可选，仅新建会话时生效），其他字段会被拒绝 |
-| `GET /sessions` | 列出自己的会话（最近使用的在前，服务重启后仍在） |
-| `GET /sessions/{id}` | 会话详情和历次运行（任务、回答、状态）；加 `?events=1` 带上每次运行的过程 |
+| `POST /run` | 提交并以 SSE 流返回过程。请求体只有 `task`、`session_id`（可选）、`model_id`（可选，仅新建会话时生效），其他字段会被拒绝。客户端断开后任务照常执行；加 `?cancel_on_disconnect=1` 则断开即取消 |
+| `POST /runs` | 只提交，立即返回 `run_id`（202） |
+| `GET /runs/{id}` | 状态（`queued` / `running` / `done` / `error` / `cancelled` / `interrupted`）、回答、步数、token 用量、停止原因 |
+| `GET /runs/{id}/events` | 事件的 SSE 流。每条事件带 `id: <序号>`；断线后带 `Last-Event-ID` 请求头（或 `?after=<序号>`）重连，从下一条接着读。可以连到任意一个入口副本 |
+| `POST /runs/{id}/cancel` | 取消。排队中的立即取消；运行中的在一秒左右内停下（正在执行的脚本会先跑完） |
+
+**会话与文件**
+
+| 接口 | 说明 |
+|---|---|
+| `POST /sessions` | 新建一个空会话，可选 `model_id`、`title` |
+| `GET /sessions` | 列出自己的会话（最近使用的在前） |
+| `GET /sessions/{id}` | 会话详情和历次运行；加 `?events=1` 带上每次运行的过程 |
+| `DELETE /sessions/{id}` | 删除会话，连同文件、对话记忆和运行记录 |
+| `POST /sessions/{id}/files` | 上传文件到会话的 inputs（multipart，字段名 `files`，可多个，单个不超过 100MB）。下一次运行时会告诉模型有哪些新文件 |
 | `GET /sessions/{id}/files` | 会话的上传文件和产物 |
 | `GET /sessions/{id}/files/{area}/{name}` | 下载一个文件，`area` 为 `inputs` 或 `outputs` |
-| `DELETE /sessions/{id}` | 删除自己的会话，连同文件、对话记忆和运行记录 |
-| `GET /models` | 可选的模型 |
-| `GET /health` | 健康检查，不需要 token |
 
-会话 id 由服务端生成并绑定用户；别人的会话和不存在的会话都返回 404。同一会话同时只能有一个任务在运行（409）。超过频率或并发上限返回 429。`/run` 的响应头里还有 `X-Run-Id`，是这次运行的编号。
+**Skill 管理**（除 `GET /skills` 外仅管理员）
+
+| 接口 | 说明 |
+|---|---|
+| `GET /skills` | 已生效的 skill |
+| `GET /skills/versions` | 所有版本，含待审核的 |
+| `POST /skills` | 上传 ZIP 或 SKILL.md（multipart，字段名 `file`），生成待审核版本 |
+| `GET /skills/{name}/versions/{v}` | 版本概要：联网声明、依赖、文件清单 |
+| `POST /skills/{name}/versions/{v}/publish` | 发布或回滚到该版本 |
+| `DELETE /skills/{name}/versions/{v}` | 删除一个未生效的版本 |
+| `DELETE /skills/{name}` | 卸载 skill，连同所有版本 |
+
+**其他**：`GET /models` 可选的模型；`GET /health` 健康检查，不需要 token。
+
+会话 id 由服务端生成并绑定用户；别人的会话、运行和不存在的都返回 404。同一会话同时只能有一个运行在排队或进行（409），这把锁在数据库里，对所有进程和副本都有效。超过频率或并发上限返回 429。
+
+**SSE 事件格式**：
+
+```
+id: 3
+data: {"type": "token", "content": "..."}          # 最终回答的流式文本（到目前为止的全文）
+data: {"type": "step", "role": "...", "content": "...", "metadata": {...}}
+data: {"type": "error", "content": "..."}           # 给用户看的出错原因和错误编号
+data: {"type": "done", "answer": "...", "status": "done"}
+```
+
+## 运行队列
+
+入口（Web UI、API）不直接执行任务，而是写一条排队的运行到数据库，由 worker 领取执行；执行过程写成事件，入口按序号读出来推给客户端。所以：
+
+- **任务不依附于请求**：客户端断开、页面关掉、入口进程重启，任务照常执行；之后用 `GET /runs/{id}/events` 或重新打开会话就能看到结果
+- **入口可以多副本**：事件在数据库里，连到哪个副本都能读
+- **worker 可以多个**：领取用一条带条件的 UPDATE，同一条运行只会被一个 worker 拿到
+- **worker 挂了能发现**：worker 定期给自己正在执行的运行续租（`RUN_LEASE_SECONDS`，默认 60 秒）；租约过期的运行被标为"中断"、会话解锁，客户端收到 `done`（`status: interrupted`）
+- **排队太久没人领**（`QUEUE_TIMEOUT`，默认 10 分钟，比如 external 模式下没有起 worker）会被标为出错
+
+队列、会话锁、限流计数和事件都在数据库里，不需要 Redis 之类的中间件；单机 SQLite 也支持多进程，多台机器时用 Postgres。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `WORKER_MODE` | `embedded` | `embedded`：入口进程里自带 worker；`external`：另起 `python -m core.worker`，入口进程不执行任务、不碰 Docker |
+| `WORKER_THREADS` | 2 | 每个进程同时执行几个任务 |
+| `RUN_LEASE_SECONDS` | 60 | worker 租约，这么久没续租就视为 worker 已不在 |
+| `QUEUE_TIMEOUT` | 600 | 排队这么久还没被领取，就判为出错 |
 
 ## Docker 沙箱
 
@@ -376,6 +457,7 @@ docker build -t agent-sandbox:latest .
 | 功能 | 说明 |
 |------|------|
 | 多轮对话 | 同一会话保持上下文；"新对话"回到空白页，原来的会话仍在历史里 |
+| 停止 | 停止当前正在进行的任务；关掉页面不会停止任务，重新打开会话即可看到结果 |
 | 历史会话 | 左侧下拉框列出自己的会话，选中即恢复聊天记录和产物，之后的消息接着它继续；可删除当前会话 |
 | 文件上传 | 上传后通过 `@input:<filename>` 供 skill 脚本引用；本轮新增或内容有变化的文件会提示给模型 |
 | 流式输出 | 工具调用步骤完成后即时推送；`final_answer` 回答内容 token 级逐字流式显示 |
@@ -419,7 +501,7 @@ my_skill.zip
 
 ```bash
 # 全量测试
-python -m pytest test_sandbox.py test_auth.py test_skill_store.py test_skill_scripts.py test_context.py -v
+python -m pytest test_sandbox.py test_auth.py test_queue.py test_skill_store.py test_skill_scripts.py test_context.py -v
 
 # 鉴权、会话归属、持久化与恢复、限流（不需要网络和 Docker）
 python -m pytest test_auth.py -v

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-FastAPI 入口：agent run 的 SSE 流式接口。
+FastAPI 入口。运行由 worker 执行（默认就在本进程里，见 WORKER_MODE），这里只负责排队和转发事件。
 
 用法:
     python -m core.auth add <用户名> --admin    # 首次使用先创建用户，拿到 token
@@ -8,31 +8,51 @@ FastAPI 入口：agent run 的 SSE 流式接口。
 
 所有接口（除 /health）都需要 `Authorization: Bearer <token>`。
 
-接口:
-    POST   /run                                   执行 agent，返回 SSE 流；响应头 X-Session-Id 是会话 id
-    GET    /sessions                              列出自己的会话（服务重启后仍在）
+运行:
+    POST   /run                                   提交并等待：返回 SSE 流；响应头 X-Session-Id、X-Run-Id
+    POST   /runs                                  只提交，立即返回 run_id；之后用下面的接口查看
+    GET    /runs/{id}                             运行的状态、回答和统计
+    GET    /runs/{id}/events                      运行事件的 SSE 流；断线后带 Last-Event-ID（或 ?after=序号）接着读
+    POST   /runs/{id}/cancel                      取消运行
+
+会话与文件:
+    POST   /sessions                              新建一个空会话（先上传文件再提问时用）
+    GET    /sessions                              列出自己的会话
     GET    /sessions/{id}                         会话详情和历次运行；?events=1 带上每次运行的过程
+    DELETE /sessions/{id}                         删除自己的会话（连同文件和记录）
+    POST   /sessions/{id}/files                   上传文件到会话的 inputs（multipart，字段名 files）
     GET    /sessions/{id}/files                   会话的上传文件和产物
     GET    /sessions/{id}/files/{area}/{name}     下载一个文件（area 为 inputs 或 outputs）
-    DELETE /sessions/{id}                         删除自己的会话（连同文件和记录）
+
+Skill 管理（仅管理员）:
+    GET    /skills                                已生效的 skill
+    GET    /skills/versions                       所有版本（含待审核的）
+    POST   /skills                                上传 ZIP 或 SKILL.md，生成待审核版本（multipart，字段名 file）
+    GET    /skills/{name}/versions/{v}            版本概要（联网声明、依赖、文件清单）
+    POST   /skills/{name}/versions/{v}/publish    发布（或回滚到）该版本
+    DELETE /skills/{name}/versions/{v}            删除一个未生效的版本
+    DELETE /skills/{name}                         卸载 skill（连同所有版本）
+
+其他:
     GET    /models                                可选的模型
     GET    /health                                健康检查
 
-SSE 事件格式（每行 data: <json>\\n\\n）:
-    {"type": "token",  "content": "..."}          # final_answer 逐字 token
+SSE 事件格式（每条带 id: <序号>）:
+    {"type": "token",  "content": "..."}          # 最终回答的流式文本（到目前为止的全文）
     {"type": "step",   "role": "...", "content": "...", "metadata": {...}}  # 步骤完成
-    {"type": "done",   "answer": "..."}            # 运行完成，附最终回答
     {"type": "error",  "content": "..."}           # 运行出错
+    {"type": "done",   "answer": "...", "status": "done|error|cancelled|interrupted"}
 """
 import asyncio
 import json
 import logging
+import shutil
 import sys
-import threading
+import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.background import BackgroundTask
@@ -40,147 +60,55 @@ from starlette.background import BackgroundTask
 PROJECT_ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from core import auth, config, db, errors
-from core.sessions import RunHandle, SessionError, SessionService
-from smolagents.memory import ActionStep, PlanningStep, FinalAnswerStep
-from smolagents.gradio_ui import pull_messages_from_step
-from smolagents.models import ChatMessageStreamDelta, agglomerate_stream_deltas
+from core import auth, config, db, skill_installer
+from core.sessions import SessionError, SessionService
+from core.skill_loader import SkillRegistry
+from core.worker import Worker
 
 logger = logging.getLogger("agent.api")
 
-# 会话、对话记忆和文件都在数据库和文件存储里；这个对象只持有可以随时重建的运行时缓存
+SKILLS_DIR = PROJECT_ROOT / "skills"
+EVENT_POLL_INTERVAL = 0.2
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+
+# 会话、运行、事件和文件都在数据库和文件存储里；这个对象只持有可以随时重建的运行时缓存
 service = SessionService()
 
 
-# ── SSE 辅助 ────────────────────────────────────────────────────────────────
-
 def _sse(obj: dict) -> str:
-    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+    seq = obj.get("seq")
+    body = {k: v for k, v in obj.items() if k != "seq"}
+    head = f"id: {seq}\n" if seq is not None else ""
+    return f"{head}data: {json.dumps(body, ensure_ascii=False)}\n\n"
 
 
-def _extract_answer_from_deltas(accumulated: list[ChatMessageStreamDelta]) -> str:
-    """从累积 delta 中提取 final_answer.answer 文本（native tool call 和 content JSON 双路径）。"""
-    msg = agglomerate_stream_deltas(accumulated)
-
-    if msg.tool_calls:
-        tc = msg.tool_calls[0]
-        if tc.function.name != "final_answer":
-            return ""
-        raw = tc.function.arguments or ""
-        try:
-            args = json.loads(raw) if isinstance(raw, str) else raw
-            return args.get("answer", "") if isinstance(args, dict) else ""
-        except json.JSONDecodeError:
-            import re
-            m = re.search(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)', raw)
-            if m:
-                partial = m.group(1)
-                partial = re.sub(r'\\u([0-9a-fA-F]{4})', lambda x: chr(int(x.group(1), 16)), partial)
-                return partial.replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\")
-        return ""
-
-    if msg.content:
-        content = msg.content.strip()
-        if not content.startswith("{"):
-            return content
-        import re
-        tool_m = re.search(r'"(?:name|tool)"\s*:\s*"([^"]+)"', content)
-        if not tool_m or tool_m.group(1) != "final_answer":
-            return ""
-        m = re.search(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)', content)
-        if m:
-            partial = m.group(1)
-            try:
-                return json.loads(f'"{partial}"')
-            except json.JSONDecodeError:
-                partial = re.sub(r'\\u([0-9a-fA-F]{4})', lambda x: chr(int(x.group(1), 16)), partial)
-                return partial.replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\")
-    return ""
-
-
-# ── 同步 → 异步桥接 ─────────────────────────────────────────────────────────
-
-def _run_agent_thread(handle: RunHandle, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
-    """在子线程中运行 agent，通过 queue 把事件推送到异步生成器；结束时把结果交回会话服务。"""
-    agent = handle.agent
-    final_answer = error_text = None
-    events: list[dict] = []
-    accumulated_deltas: list[ChatMessageStreamDelta] = []
-
-    def emit(payload: dict):
-        asyncio.run_coroutine_threadsafe(queue.put(payload), loop).result()
-
+async def _event_stream(user: auth.User, run_id: str, after: int = 0, cancel_on_disconnect: bool = False):
+    """从数据库按序号读运行事件推给客户端，直到 done。客户端断开时运行照常继续（除非要求取消）。"""
+    finished = False
     try:
-        # 记忆已经从数据库恢复，所以总是接着之前的对话继续（新会话时记忆本来就是空的）
-        for event in agent.run(handle.task, stream=True, reset=False):
-            if isinstance(event, ChatMessageStreamDelta):
-                accumulated_deltas.append(event)
-                content = _extract_answer_from_deltas(accumulated_deltas)
-                if content:
-                    emit({"type": "token", "content": content})
-
-            elif isinstance(event, (ActionStep, PlanningStep, FinalAnswerStep)):
-                accumulated_deltas = []
-                for msg in pull_messages_from_step(
-                    event, skip_model_outputs=getattr(agent, "stream_outputs", False)
-                ):
-                    payload = {"type": "step", "role": msg.role, "content": msg.content or ""}
-                    if msg.metadata:
-                        payload["metadata"] = msg.metadata
-                    events.append({k: v for k, v in payload.items() if k != "type"})
-                    emit(payload)
-
-                if isinstance(event, FinalAnswerStep):
-                    final_answer = str(event.output) if event.output is not None else None
-
-    except Exception as e:
-        # 异常详情可能带模型服务地址等内部信息，只记日志，给调用方原因类别和错误编号
-        error_text = errors.describe(e, handle.session_id)
-        try:
-            emit({"type": "error", "content": error_text})
-        except Exception:
-            pass
+        while True:
+            batch = await asyncio.to_thread(service.read_events, user, run_id, after)
+            for event in batch:
+                after = event["seq"]
+                yield _sse(event)
+                if event["type"] == "done":
+                    finished = True
+                    return
+            if not batch:
+                await asyncio.sleep(EVENT_POLL_INTERVAL)
     finally:
-        # 先落库并释放会话，再通知客户端结束：客户端收到 done 后马上发下一条也不会撞上"正在运行"
-        try:
-            service.finish_run(handle, answer=final_answer, error=error_text, events=events)
-        except Exception:
-            logger.exception("finish_run failed (session=%s)", handle.session_id)
-        try:
-            emit({"type": "done", "answer": final_answer or ""})
-        except Exception:
-            pass
-
-
-def _start_run(handle: RunHandle) -> tuple[asyncio.Queue, threading.Thread]:
-    """启动 agent 线程。在返回响应之前就启动，保证会话一定会被释放（即使客户端马上断开）。"""
-    loop = asyncio.get_running_loop()
-    queue: asyncio.Queue = asyncio.Queue()
-    thread = threading.Thread(target=_run_agent_thread, args=(handle, queue, loop), daemon=True)
-    try:
-        thread.start()
-    except BaseException:
-        service.finish_run(handle, error="运行未能启动")
-        raise
-    return queue, thread
-
-
-async def _event_stream(queue: asyncio.Queue, thread: threading.Thread):
-    while True:
-        event = await queue.get()
-        yield _sse(event)
-        if event["type"] == "done":
-            break
-
-    # 不能在事件循环里直接 join：线程正等着事件循环确认最后一次推送，会互相卡住 5 秒
-    await asyncio.to_thread(thread.join, 5)
+        if cancel_on_disconnect and not finished:
+            try:
+                await asyncio.to_thread(service.cancel, user, run_id)
+            except Exception:
+                logger.exception("cancel on disconnect failed (run=%s)", run_id)
 
 
 # ── FastAPI ──────────────────────────────────────────────────────────────────
 
 async def _sweep_loop():
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(15)   # 包括收拾无主的运行：worker 崩溃后十几秒内就能发现
         try:
             await asyncio.to_thread(service.sweep)
         except Exception:
@@ -191,13 +119,18 @@ async def _sweep_loop():
 async def lifespan(app: FastAPI):
     db.get_engine()           # 连接数据库并升级表结构
     auth.check_startup()
-    if config.USE_DOCKER:
-        from core.executor import cleanup_orphans
-        cleanup_orphans()     # 上次进程崩溃后遗留的沙箱容器
-    service.startup()
+    worker = None
+    if config.WORKER_MODE == "embedded":
+        if config.USE_DOCKER:
+            from core.executor import cleanup_orphans
+            cleanup_orphans()     # 上次进程崩溃后遗留的沙箱容器
+        service.startup()
+        worker = Worker(service).start()
     sweeper = asyncio.create_task(_sweep_loop())
     yield
     sweeper.cancel()
+    if worker is not None:
+        await asyncio.to_thread(worker.stop, 10)
     service.close()
 
 
@@ -207,6 +140,11 @@ app = FastAPI(title="Agent Skills API", lifespan=lifespan)
 @app.exception_handler(SessionError)
 async def _session_error(request: Request, exc: SessionError):
     return JSONResponse(status_code=exc.status, content={"detail": exc.message})
+
+
+@app.exception_handler(skill_installer.SkillInstallError)
+async def _skill_error(request: Request, exc: skill_installer.SkillInstallError):
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
 def current_user(request: Request) -> auth.User:
@@ -219,34 +157,85 @@ def current_user(request: Request) -> auth.User:
     return user
 
 
+def admin_user(user: auth.User = Depends(current_user)) -> auth.User:
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="只有管理员可以管理 skill")
+    return user
+
+
+# ── 运行 ─────────────────────────────────────────────────────────────────────
+
 class RunRequest(BaseModel):
     # 多余的字段（如 api_base / api_key）直接拒绝，而不是悄悄忽略
     model_config = ConfigDict(extra="forbid")
 
     task: str = Field(min_length=1, max_length=config.MAX_TASK_CHARS)
-    session_id: str | None = None   # 不传则新建会话；只能是 X-Session-Id 返回过的值
+    session_id: str | None = None   # 不传则新建会话；只能是服务端返回过的会话 id
     model_id: str | None = None     # 只在新建会话时生效，必须在 GET /models 的列表里
 
 
 @app.post("/run")
-async def run(req: RunRequest, user: auth.User = Depends(current_user)):
-    """执行 agent 任务，返回 SSE 流。
+async def run(req: RunRequest, cancel_on_disconnect: bool = False, user: auth.User = Depends(current_user)):
+    """提交运行并以 SSE 流返回过程。断线后可以用 GET /runs/{id}/events 接着读，运行不受影响。
 
     客户端示例：
-        curl -X POST http://localhost:8000/run \\
-             -H "Authorization: Bearer $TOKEN" \\
-             -H "Content-Type: application/json" \\
-             -d '{"task": "北京负责人是谁"}' \\
-             --no-buffer -D -
+        curl -N -D - -X POST http://localhost:8000/run \\
+             -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
+             -d '{"task": "北京负责人是谁"}'
     """
-    handle = await asyncio.to_thread(
-        service.start_run, user, req.session_id, req.model_id, req.task, "api")
-    queue, thread = _start_run(handle)
+    session_id, run_id = await asyncio.to_thread(
+        service.submit, user, req.session_id, req.model_id, req.task, "api")
     return StreamingResponse(
-        _event_stream(queue, thread),
+        _event_stream(user, run_id, 0, cancel_on_disconnect),
         media_type="text/event-stream",
-        headers={"X-Session-Id": handle.session_id, "X-Run-Id": handle.run_id},
+        headers={"X-Session-Id": session_id, "X-Run-Id": run_id},
     )
+
+
+@app.post("/runs", status_code=202)
+async def submit_run(req: RunRequest, user: auth.User = Depends(current_user)):
+    """只提交，立即返回。适合长任务：之后轮询 GET /runs/{id}，或订阅 GET /runs/{id}/events。"""
+    session_id, run_id = await asyncio.to_thread(
+        service.submit, user, req.session_id, req.model_id, req.task, "api")
+    return {"session_id": session_id, "run_id": run_id, "status": "queued"}
+
+
+@app.get("/runs/{run_id}")
+async def get_run(run_id: str, user: auth.User = Depends(current_user)):
+    return await asyncio.to_thread(service.get_run, user, run_id)
+
+
+@app.get("/runs/{run_id}/events")
+async def run_events(run_id: str, request: Request, after: int = None, cancel_on_disconnect: bool = False,
+                     user: auth.User = Depends(current_user)):
+    """运行事件的 SSE 流。从序号 after 之后开始；没给时取 Last-Event-ID 请求头，都没有则从头。"""
+    await asyncio.to_thread(service.get_run, user, run_id)   # 先校验归属，不存在直接 404
+    if after is None:
+        last = request.headers.get("last-event-id", "")
+        after = int(last) if last.isdigit() else 0
+    return StreamingResponse(_event_stream(user, run_id, after, cancel_on_disconnect),
+                             media_type="text/event-stream")
+
+
+@app.post("/runs/{run_id}/cancel")
+async def cancel_run(run_id: str, user: auth.User = Depends(current_user)):
+    status = await asyncio.to_thread(service.cancel, user, run_id)
+    return {"run_id": run_id, "status": status}
+
+
+# ── 会话与文件 ───────────────────────────────────────────────────────────────
+
+class NewSession(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    model_id: str | None = None
+    title: str = ""
+
+
+@app.post("/sessions", status_code=201)
+async def create_session(req: NewSession = None, user: auth.User = Depends(current_user)):
+    req = req or NewSession()
+    sid = await asyncio.to_thread(service.ensure_session, user, None, req.model_id, "api", req.title)
+    return {"session_id": sid}
 
 
 @app.get("/sessions")
@@ -256,8 +245,34 @@ async def list_sessions(user: auth.User = Depends(current_user)):
 
 @app.get("/sessions/{session_id}")
 async def get_session(session_id: str, events: bool = False, user: auth.User = Depends(current_user)):
-    """会话详情和历次运行（任务、回答、状态）。events=1 时带上每次运行的过程。"""
+    """会话详情和历次运行（任务、回答、状态、统计）。events=1 时带上每次运行的过程。"""
     return await asyncio.to_thread(service.get_session, user, session_id, events)
+
+
+@app.post("/sessions/{session_id}/files")
+async def upload_files(session_id: str, files: list[UploadFile] = File(...),
+                       user: auth.User = Depends(current_user)):
+    """上传文件到会话的 inputs，脚本里用 @input:<文件名> 引用。下一次运行开始时会提示模型有新文件。"""
+    tmp = Path(tempfile.mkdtemp(prefix="agent_up_"))
+    try:
+        paths = []
+        for f in files:
+            name = Path(f.filename or "").name
+            if not name or name in (".", ".."):
+                raise HTTPException(status_code=400, detail="文件名不合法")
+            dest = tmp / name
+            size = 0
+            with dest.open("wb") as out:
+                while chunk := await f.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > MAX_UPLOAD_BYTES:
+                        raise HTTPException(status_code=413, detail=f"单个文件不能超过 {MAX_UPLOAD_BYTES // (1024 * 1024)}MB")
+                    out.write(chunk)
+            paths.append(dest)
+        changed = await asyncio.to_thread(service.add_inputs, user, session_id, paths)
+        return {"uploaded": [p.name for p in paths], "changed": changed}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 @app.get("/sessions/{session_id}/files")
@@ -268,7 +283,6 @@ async def list_files(session_id: str, user: auth.User = Depends(current_user)):
 @app.get("/sessions/{session_id}/files/{area}/{name:path}")
 async def download_file(session_id: str, area: str, name: str, user: auth.User = Depends(current_user)):
     """下载会话的一个上传文件（area=inputs）或产物（area=outputs）。"""
-    import shutil
     path = await asyncio.to_thread(service.fetch_file, user, session_id, area, name)
     return FileResponse(path, filename=path.name,
                         background=BackgroundTask(shutil.rmtree, path.parent, ignore_errors=True))
@@ -279,6 +293,77 @@ async def delete_session(session_id: str, user: auth.User = Depends(current_user
     """删除自己的某个会话，连同它的文件、对话记忆和运行记录。"""
     await asyncio.to_thread(service.delete_session, user, session_id)
     return {"deleted": session_id}
+
+
+# ── Skill 管理（仅管理员）────────────────────────────────────────────────────
+
+def _build_skill_image(skill_dir, name):
+    if config.USE_DOCKER:
+        from core.executor import build_skill_image
+        build_skill_image(skill_dir, config.DOCKER_IMAGE, name=name)
+
+
+@app.get("/skills")
+async def list_skills(user: auth.User = Depends(current_user)):
+    reg = await asyncio.to_thread(SkillRegistry, SKILLS_DIR)
+    return {"skills": [{
+        "name": s.name, "description": s.meta.description, "network": s.meta.network,
+        "version": skill_installer.active_version(s.name, SKILLS_DIR),
+    } for s in reg.skills.values()]}
+
+
+@app.get("/skills/versions")
+async def list_skill_versions(user: auth.User = Depends(admin_user)):
+    return {"versions": skill_installer.list_versions(SKILLS_DIR)}
+
+
+@app.post("/skills", status_code=201)
+async def upload_skill(file: UploadFile = File(...), user: auth.User = Depends(admin_user)):
+    """上传 ZIP 或 SKILL.md，生成一个待审核版本。发布后才生效。"""
+    name = Path(file.filename or "").name
+    suffix = Path(name).suffix.lower()
+    if suffix not in (".zip", ".md"):
+        raise HTTPException(status_code=400, detail="只支持 .zip 或 SKILL.md")
+    tmp = Path(tempfile.mkdtemp(prefix="agent_skill_"))
+    try:
+        dest = tmp / name
+        data = await file.read(skill_installer.MAX_ZIP_BYTES + 1)
+        if len(data) > skill_installer.MAX_ZIP_BYTES:
+            raise HTTPException(status_code=413, detail="文件过大")
+        dest.write_bytes(data)
+        install = skill_installer.install_from_zip if suffix == ".zip" else skill_installer.install_from_skill_md
+        skill, version, msg = await asyncio.to_thread(install, dest, SKILLS_DIR, user.name)
+        return {"name": skill, "version": version, "status": "pending", "message": msg}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@app.get("/skills/{name}/versions/{version}")
+async def skill_version(name: str, version: int, user: auth.User = Depends(admin_user)):
+    return {"name": name, "version": version,
+            "summary": await asyncio.to_thread(skill_installer.review_summary, name, version, SKILLS_DIR)}
+
+
+@app.post("/skills/{name}/versions/{version}/publish")
+async def publish_skill(name: str, version: int, user: auth.User = Depends(admin_user)):
+    """发布（或回滚到）某个版本。带依赖的 skill 会先构建镜像，可能需要一两分钟。"""
+    try:
+        msg = await asyncio.to_thread(skill_installer.publish, name, version, SKILLS_DIR, user.name,
+                                      _build_skill_image)
+    except RuntimeError as e:   # 镜像构建失败：版本保持原状态
+        raise HTTPException(status_code=422, detail=str(e))
+    return {"name": name, "version": version, "message": msg}
+
+
+@app.delete("/skills/{name}/versions/{version}")
+async def discard_skill_version(name: str, version: int, user: auth.User = Depends(admin_user)):
+    return {"message": await asyncio.to_thread(skill_installer.discard_version, name, version, SKILLS_DIR)}
+
+
+@app.delete("/skills/{name}")
+async def uninstall_skill(name: str, user: auth.User = Depends(admin_user)):
+    _, msg = await asyncio.to_thread(skill_installer.uninstall_skill, name, SKILLS_DIR)
+    return {"message": msg}
 
 
 @app.get("/models")

@@ -55,6 +55,13 @@ MAX_CONCURRENT_RUNS_PER_USER = _int("MAX_CONCURRENT_RUNS_PER_USER", 2)
 RATE_LIMIT_PER_MINUTE = _int("RATE_LIMIT_PER_MINUTE", 30)    # 每用户每分钟的请求数
 MAX_TASK_CHARS = _int("MAX_TASK_CHARS", 20000)
 
+# 运行队列：入口只负责排队，由 worker 执行
+# embedded（默认）：Web UI / API 进程里自带 worker 线程；external：另起 `python -m core.worker`，入口进程不执行任何运行
+WORKER_MODE = os.getenv("WORKER_MODE", "embedded").strip().lower()
+WORKER_THREADS = _int("WORKER_THREADS", 2)            # 每个进程同时执行几个运行
+RUN_LEASE_SECONDS = _int("RUN_LEASE_SECONDS", 60)     # worker 的租约；这么久没续租就视为 worker 已不在
+QUEUE_TIMEOUT = _int("QUEUE_TIMEOUT", 600)            # 排队这么久还没有 worker 领取，就判为出错
+
 # 单次运行的预算：任一用完就停止，并让模型交代做完了什么、还剩什么
 MAX_STEPS = _int("MAX_STEPS", 15)
 RUN_TOKEN_BUDGET = _int("RUN_TOKEN_BUDGET", 300000)   # 一次运行累计消耗的 token（输入 + 输出），0 为不限

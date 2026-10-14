@@ -19,8 +19,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from sqlalchemy import (
-    BigInteger, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint,
-    create_engine, event,
+    BigInteger, Boolean, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint,
+    create_engine, event, false,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
@@ -58,6 +58,8 @@ class ChatSession(Base):
     created_at: Mapped[float] = mapped_column(Float, default=time.time)
     last_used_at: Mapped[float] = mapped_column(Float, default=time.time)
     deleted_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # 会话锁：正在排队或运行的那次运行。同一会话同时只能有一个，跨进程、跨副本都有效
+    active_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     __table_args__ = (Index("ix_sessions_owner_last_used", "owner", "last_used_at"),)
 
@@ -70,7 +72,8 @@ class Run(Base):
     session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"))
     owner: Mapped[str] = mapped_column(String(64))
     task: Mapped[str] = mapped_column(Text)
-    status: Mapped[str] = mapped_column(String(16), default="running")  # running / done / error / interrupted
+    # queued → running → done / error / cancelled / interrupted（执行它的 worker 没了）
+    status: Mapped[str] = mapped_column(String(16), default="queued")
     answer: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     events: Mapped[list | None] = mapped_column(JSON, nullable=True)      # 展示给用户的过程（与 SSE 的 step 事件一致）
@@ -83,11 +86,31 @@ class Run(Base):
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 单次请求最大的输入，即上下文长度的峰值
     stop_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)  # 因预算或打转被提前停止时的原因
+    source: Mapped[str | None] = mapped_column(String(16), nullable=True)        # web / api
+    queued_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    claimed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    lease_until: Mapped[float | None] = mapped_column(Float, nullable=True)      # worker 的租约，过期视为 worker 已不在
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
 
     __table_args__ = (
         Index("ix_runs_session_started", "session_id", "started_at"),
         Index("ix_runs_owner_started", "owner", "started_at"),
+        Index("ix_runs_status_queued", "status", "queued_at"),
     )
+
+
+class RunEvent(Base):
+    """运行过程中推给客户端的事件。客户端断线后可以从某个序号接着读。"""
+    __tablename__ = "run_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"))
+    seq: Mapped[int] = mapped_column(Integer)
+    type: Mapped[str] = mapped_column(String(16))      # token / step / error / done
+    payload: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[float] = mapped_column(Float, default=time.time)
+
+    __table_args__ = (UniqueConstraint("run_id", "seq", name="uq_run_events_run_seq"),)
 
 
 class Step(Base):
@@ -115,6 +138,7 @@ class FileEntry(Base):
     size: Mapped[int] = mapped_column(BigInteger)
     mtime_ns: Mapped[int] = mapped_column(BigInteger)
     storage_key: Mapped[str] = mapped_column(String(700))
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     updated_at: Mapped[float] = mapped_column(Float, default=time.time)
 
     __table_args__ = (UniqueConstraint("session_id", "area", "name", name="uq_files_session_area_name"),)
